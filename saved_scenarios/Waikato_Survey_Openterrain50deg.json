@@ -1,0 +1,59 @@
+{
+  "cameras": [
+    {
+      "enabled": false,
+      "label": "Nadir",
+      "body": "Sony A7R V",
+      "focal_mm": 21.0,
+      "tilt_deg": 0.0,
+      "tilt_conv": "nadir",
+      "orientation": "landscape",
+      "tilt_axis": "across"
+    },
+    {
+      "enabled": true,
+      "label": "Right oblique",
+      "body": "Sony A7R V",
+      "focal_mm": 50.0,
+      "tilt_deg": 50.0,
+      "tilt_conv": "horiz",
+      "orientation": "portrait",
+      "tilt_axis": "across"
+    },
+    {
+      "enabled": true,
+      "label": "Left oblique",
+      "body": "Sony A7R V",
+      "focal_mm": 50.0,
+      "tilt_deg": 50.0,
+      "tilt_conv": "horiz",
+      "orientation": "portrait",
+      "tilt_axis": "across"
+    },
+    {
+      "enabled": true,
+      "label": "Fore oblique",
+      "body": "Sony A7R V",
+      "focal_mm": 50.0,
+      "tilt_deg": 50.0,
+      "tilt_conv": "horiz",
+      "orientation": "landscape",
+      "tilt_axis": "along"
+    },
+    {
+      "enabled": true,
+      "label": "Aft oblique",
+      "body": "Sony A7R V",
+      "focal_mm": 50.0,
+      "tilt_deg": 50.0,
+      "tilt_conv": "horiz",
+      "orientation": "landscape",
+      "tilt_axis": "along"
+    }
+  ],
+  "altitude_m": 650.0,
+  "speed_ms": 62.0,
+  "fwd_overlap_pct": 35,
+  "sidelap_pct": 15,
+  "reciprocal": true
+}
