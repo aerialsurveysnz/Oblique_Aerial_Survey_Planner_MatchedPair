@@ -1514,8 +1514,8 @@ if selected_overlap_preset != st.session_state.overlap_preset_last:
         st.session_state.side_pct = preset_values["side"]
     st.session_state.overlap_preset_last = selected_overlap_preset
 
-fwd_pct  = st.sidebar.slider("Forward overlap (%)", 10, 95, key="fwd_pct")
-side_pct = st.sidebar.slider("Sidelap (%)", 10, 95, key="side_pct")
+fwd_pct  = st.sidebar.slider("Forward overlap (%)", 0, 95, key="fwd_pct")
+side_pct = st.sidebar.slider("Sidelap (%)", 0, 95, key="side_pct")
 fwd_frac  = fwd_pct  / 100.0
 side_frac = side_pct / 100.0
 
@@ -2364,20 +2364,9 @@ help_toggle(
     key="point_coverage_intro",
 )
 
-coverage_precision_options = {
-    "Fast preview": (31, 31),
-    "Standard": (61, 61),
-    "High precision": (101, 101),
-}
-coverage_precision = st.selectbox(
-    "Coverage sampling precision",
-    list(coverage_precision_options.keys()),
-    index=1,
-    help="Higher precision samples more points inside the repeating cell and reduces the chance of missing very narrow gaps. It is slower, but more defensible when checking low-overlap setups.",
-)
-samples_x, samples_y = coverage_precision_options[coverage_precision]
+samples_x, samples_y = 61, 61
 sample_grid_label = coverage_sampling_label(samples_x, samples_y)
-st.caption(f"{coverage_precision}: {sample_grid_label} tested across one repeat cell.")
+st.caption(f"Standard: {sample_grid_label} tested across one repeat cell.")
 
 line_spacing_pc, photo_spacing_pc, used_pc_fallback = fallback_multistrip_spacing(
     solutions,
@@ -2416,14 +2405,14 @@ if coverage_result is not None:
                 f"Exact zero-coverage gap present. {format_gap_pct(gap_stats['zero_hit_pct'])} of the repeat-cell area has no image coverage."
             )
             warning_detail = (
-                f"The heatmaps and min/avg/max values are still sampled at {coverage_precision.lower()} "
+                f"The heatmaps and min/avg/max values are still sampled at Standard "
                 f"using a {sample_grid_label}, but the gap warning itself is based on an exact geometric check. "
                 f"For reference, {gap_stats['sample_zero_hit_pct']:.1f}% of sampled points had zero image hits and "
                 f"{gap_stats['sample_zero_angle_pct']:.1f}% had zero viewing angles."
             )
         else:
             warning_summary = (
-                f"Sampled coverage gaps detected at {coverage_precision.lower()} using a {sample_grid_label}."
+                f"Sampled coverage gaps detected at Standard using a {sample_grid_label}."
             )
             warning_detail = (
                 f"{gap_stats['sample_zero_hit_pct']:.1f}% of sampled points had zero image hits, and "
@@ -2450,11 +2439,11 @@ if coverage_result is not None:
         if gap_stats["exact_available"]:
             st.success(
                 f"No exact zero-coverage gaps detected inside the repeat cell. "
-                f"The heatmaps and min/avg/max below are still sampled at {coverage_precision.lower()} using a {sample_grid_label}."
+               f"The heatmaps and min/avg/max below are still sampled at Standard using a {sample_grid_label}."
             )
         else:
             st.success(
-                f"No sampled gaps detected at {coverage_precision.lower()} using a {sample_grid_label}. "
+                f"No sampled gaps detected at Standard using a {sample_grid_label}. "
                 "This is a sampled check of the repeat cell, not a formal geometric proof."
             )
 
