@@ -156,61 +156,16 @@ st.set_page_config(page_title="Oblique Survey Planner", page_icon="ASL_Imagery_I
 st.markdown(
     """
     <style>
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stHeader"],
-    [data-testid="stMainBlockContainer"] {
+    .stApp {
         background: #123b6d !important;
-        color: #f0f6fc !important;
     }
 
-    [data-testid="stSidebar"] {
-        background: #0f2f57 !important;
+    [data-testid="stAppViewContainer"] {
+        background: #123b6d !important;
     }
 
-    .stApp,
-    .stApp p,
-    .stApp span,
-    .stApp div,
-    .stApp label,
-    .stApp li,
-    .stApp h1,
-    .stApp h2,
-    .stApp h3,
-    .stApp h4,
-    .stApp h5,
-    .stApp h6,
-    .stApp small,
-    .stApp strong,
-    .stApp em,
-    [data-testid="stSidebar"] *,
-    [data-testid="stMetricLabel"],
-    [data-testid="stMetricValue"],
-    [data-testid="stCaptionContainer"],
-    [data-testid="stMarkdownContainer"] {
-        color: #f0f6fc !important;
-    }
-
-    .stApp a {
-        color: #9ecbff !important;
-    }
-
-    [data-baseweb="input"] input,
-    [data-baseweb="base-input"] input,
-    [data-baseweb="select"] > div,
-    [data-baseweb="select"] span,
-    textarea,
-    .stTextInput input,
-    .stNumberInput input {
-        color: #f0f6fc !important;
-        background-color: rgba(13, 17, 23, 0.32) !important;
-    }
-
-    [data-baseweb="select"] svg,
-    .stCheckbox svg,
-    .stRadio svg {
-        color: #f0f6fc !important;
-        fill: #f0f6fc !important;
+    [data-testid="stHeader"] {
+        background: #123b6d !important;
     }
     </style>
     """,
@@ -2405,24 +2360,13 @@ coverage_probe = None
 
 help_toggle(
     "Point Coverage / Views Per Point",
-    "This section samples one repeating survey cell to estimate how many times a ground point is captured within the pattern. Image hits count every photo that sees the point. Distinct viewing angles count unique camera directions such as nadir, left oblique, right oblique, fore oblique and aft oblique. Use the min, average and max together because coverage is not uniform across the block. The no-coverage check is reported both mathematically from the exact repeating-cell geometry when Shapely is available, and on a sampling basis from the selected test grid.",
+    "This section samples one repeating survey cell to estimate how many times a ground point is captured within the pattern. Image hits count every photo that sees the point. Distinct viewing angles count unique camera directions such as nadir, left oblique, right oblique, fore oblique and aft oblique. Use the min, average and max together because coverage is not uniform across the block. The min/average/max figures and heatmaps are sampled across one repeat cell, while the red gap warning below now also uses an exact geometric zero-coverage check when Shapely is available. Standard precision means a 61 × 61 sample grid, which is 3,721 tested points across one repeat cell.",
     key="point_coverage_intro",
 )
 
-coverage_precision_options = {
-    "Fast preview": (31, 31),
-    "Standard": (61, 61),
-    "High precision": (101, 101),
-}
-coverage_precision = st.selectbox(
-    "Coverage sampling precision",
-    list(coverage_precision_options.keys()),
-    index=1,
-    help="Higher precision samples more points inside the repeating cell and reduces the chance of missing very narrow gaps. It is slower, but more defensible when checking low-overlap setups.",
-)
-samples_x, samples_y = coverage_precision_options[coverage_precision]
+samples_x, samples_y = 61, 61
 sample_grid_label = coverage_sampling_label(samples_x, samples_y)
-st.caption(f"{coverage_precision}: {sample_grid_label} tested across one repeat cell.")
+st.caption(f"Standard: {sample_grid_label} tested across one repeat cell.")
 
 line_spacing_pc, photo_spacing_pc, used_pc_fallback = fallback_multistrip_spacing(
     solutions,
@@ -2461,14 +2405,14 @@ if coverage_result is not None:
                 f"Exact zero-coverage gap present. {format_gap_pct(gap_stats['zero_hit_pct'])} of the repeat-cell area has no image coverage."
             )
             warning_detail = (
-                f"The heatmaps and min/avg/max values are still sampled at {coverage_precision.lower()} "
+                f"The heatmaps and min/avg/max values are still sampled at Standard "
                 f"using a {sample_grid_label}, but the gap warning itself is based on an exact geometric check. "
                 f"For reference, {gap_stats['sample_zero_hit_pct']:.1f}% of sampled points had zero image hits and "
                 f"{gap_stats['sample_zero_angle_pct']:.1f}% had zero viewing angles."
             )
         else:
             warning_summary = (
-                f"Sampled coverage gaps detected at {coverage_precision.lower()} using a {sample_grid_label}."
+                f"Sampled coverage gaps detected at Standard using a {sample_grid_label}."
             )
             warning_detail = (
                 f"{gap_stats['sample_zero_hit_pct']:.1f}% of sampled points had zero image hits, and "
@@ -2495,30 +2439,13 @@ if coverage_result is not None:
         if gap_stats["exact_available"]:
             st.success(
                 f"No exact zero-coverage gaps detected inside the repeat cell. "
-               f"The heatmaps and min/avg/max below are still sampled at {coverage_precision.lower()} using a {sample_grid_label}."
+               f"The heatmaps and min/avg/max below are still sampled at Standard using a {sample_grid_label}."
             )
         else:
             st.success(
-                f"No sampled gaps detected at {coverage_precision.lower()} using a {sample_grid_label}. "
+                f"No sampled gaps detected at Standard using a {sample_grid_label}. "
                 "This is a sampled check of the repeat cell, not a formal geometric proof."
             )
-
-    gap_metric_1, gap_metric_2 = st.columns(2)
-    metric_with_help(
-        gap_metric_1,
-        "No coverage mathematically",
-        format_gap_pct(gap_stats["zero_hit_pct"]),
-        "This is the exact zero-coverage percentage of one repeating survey cell when the geometric check is available. It matches the old mathematical no-coverage check. If Shapely is unavailable, this falls back to the sampled result.",
-    )
-    metric_with_help(
-        gap_metric_2,
-        "No coverage by sampling",
-        format_gap_pct(gap_stats["sample_zero_hit_pct"]),
-        "This is the sampled zero-coverage percentage across the selected repeat-cell test grid. It matches the old sampling-basis no-coverage check and will reduce toward the mathematical value as sampling precision increases.",
-    )
-    st.caption(
-        "Mathematical = exact repeating-cell gap area when available. Sampling = percentage of tested points with zero image coverage at the selected precision."
-    )
 
     m1, m2, m3 = st.columns(3)
     metric_with_help(
