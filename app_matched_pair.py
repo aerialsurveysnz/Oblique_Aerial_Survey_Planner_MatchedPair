@@ -153,6 +153,12 @@ REPORT_LOGO_CANDIDATES = [
     Path("/mnt/data/cdb78639-5338-4c0f-88eb-fa20a9521e12.png"),
 ]
 
+STORAGE_PROFILE_OPTIONS = {
+    "Uncompressed RAW": 130.0,
+    "Lossless Compressed RAW L": 82.5,
+    "Compressed RAW": 70.0,
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -432,6 +438,8 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Photo spacing", fmt(float(mission_outputs.get("photo_spacing_m", 0.0)), dist_unit)],
         ["Total line length", f"{total_line_km:,.2f} km"],
         ["Average line length", f"{avg_line_km:,.2f} km"],
+        ["Storage profile", mission_outputs.get("storage_profile_label", "Uncompressed RAW")],
+        ["Storage per image", f"{float(mission_outputs.get('storage_mb_per_image', 0.0)):.1f} MB/image"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
         ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr"],
@@ -1592,13 +1600,11 @@ def iter_line_geometries(geom):
             yield from iter_line_geometries(sub_geom)
 
 
-def estimate_camera_file_size_mb(cam):
-    bd = get_body(cam["body"])
-    megapixels = (float(bd["w_px"]) * float(bd["h_px"])) / 1_000_000.0
-    return megapixels * 1.0
+def estimate_camera_file_size_mb(cam, storage_mb_per_image=130.0):
+    return float(storage_mb_per_image)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_mb_per_image=130.0):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -1641,7 +1647,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
-    per_trigger_storage_mb = sum(estimate_camera_file_size_mb(cam) for cam in enabled_cameras)
+    per_trigger_storage_mb = sum(estimate_camera_file_size_mb(cam, storage_mb_per_image=storage_mb_per_image) for cam in enabled_cameras)
     total_storage_mb = total_exposures * per_trigger_storage_mb
     airborne_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
     total_turn_time_s = max(line_count - 1, 0) * turn_time_per_line_s
@@ -1690,6 +1696,8 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "frames_per_camera": int(total_exposures),
         "total_images": int(total_images),
         "per_trigger_storage_mb": float(per_trigger_storage_mb),
+        "storage_profile_label": str(storage_profile_label),
+        "storage_mb_per_image": float(storage_mb_per_image),
         "total_storage_mb": float(total_storage_mb),
         "airborne_time_s": float(airborne_time_s),
         "turn_time_per_line_s": float(turn_time_per_line_s),
@@ -2188,7 +2196,7 @@ st.markdown("---")
 st.subheader("AOI / Mission Outputs")
 help_toggle(
     "Area-based outputs",
-    "This section turns the current line spacing and photo spacing into job-level outputs. You can use the built-in 100 km² example for like-for-like comparisons, or load a KML from the aoi_library folder on the server. Outputs are illustrative planning numbers based on clipped parallel lines across the AOI, the current photo spacing, enabled camera count and a simple RAW storage estimate of about 1 MB per megapixel per image.",
+    "This section turns the current line spacing and photo spacing into job-level outputs. You can use the built-in 100 km² example for like-for-like comparisons, or load a KML from the aoi_library folder on the server. Outputs are illustrative planning numbers based on clipped parallel lines across the AOI, the current photo spacing, enabled camera count and the selected RAW storage profile.",
     key="aoi_outputs_intro",
 )
 
@@ -2272,6 +2280,14 @@ else:
             key="aoi_turn_time_per_line_min",
             help="Allowance added between consecutive flight runs.",
         )
+        storage_profile_label = st.selectbox(
+            "RAW storage estimate",
+            list(STORAGE_PROFILE_OPTIONS.keys()),
+            index=list(STORAGE_PROFILE_OPTIONS.keys()).index("Uncompressed RAW"),
+            key="aoi_storage_profile_label",
+            help="Choose the per-image storage estimate used for mission totals.",
+        )
+        storage_mb_per_image = STORAGE_PROFILE_OPTIONS[storage_profile_label]
 
     if aoi_payload is not None:
         mission_outputs = compute_aoi_mission_outputs(
@@ -2283,6 +2299,8 @@ else:
             flight_azimuth_deg=flight_azimuth_deg,
             lead_in_out_m=lead_in_out_m,
             turn_time_per_line_min=turn_time_per_line_min,
+            storage_profile_label=storage_profile_label,
+            storage_mb_per_image=storage_mb_per_image,
         )
 
     if mission_outputs is not None:
@@ -2300,7 +2318,7 @@ else:
 
         st.caption(
             f"Frames per camera = {mission_outputs['frames_per_camera']}. Total images assumes {len(active)} enabled camera(s) fire at each trigger event. "
-            f"Storage is a rough estimate using about 1 MB per megapixel per image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
+            f"Storage uses {mission_outputs['storage_profile_label']} at {mission_outputs['storage_mb_per_image']:.1f} MB/image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
             f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs."
         )
 
