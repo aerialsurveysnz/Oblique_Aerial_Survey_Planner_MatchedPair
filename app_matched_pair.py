@@ -433,7 +433,8 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Total line length", f"{total_line_km:,.2f} km"],
         ["Average line length", f"{avg_line_km:,.2f} km"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
-        ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 60.0:.1f} min"],
+        ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
+        ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr"],
     ]
 
 
@@ -1594,7 +1595,7 @@ def estimate_camera_file_size_mb(cam):
     return megapixels * 1.0
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -1604,6 +1605,8 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         return None
     if not (np.isfinite(line_spacing_m) and line_spacing_m > 0 and np.isfinite(photo_spacing_m) and photo_spacing_m > 0):
         return None
+
+    turn_time_per_line_s = max(float(turn_time_per_line_min), 0.0) * 60.0
 
     rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
     minx, miny, maxx, maxy = rotated.bounds
@@ -1637,7 +1640,9 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     total_images = total_exposures * enabled_cam_count
     per_trigger_storage_mb = sum(estimate_camera_file_size_mb(cam) for cam in enabled_cameras)
     total_storage_mb = total_exposures * per_trigger_storage_mb
-    flight_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
+    airborne_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
+    total_turn_time_s = max(line_count - 1, 0) * turn_time_per_line_s
+    flight_time_s = airborne_time_s + total_turn_time_s if np.isfinite(airborne_time_s) else float("nan")
 
     mission_line_geometries = []
     for x in offsets:
@@ -1683,6 +1688,9 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "total_images": int(total_images),
         "per_trigger_storage_mb": float(per_trigger_storage_mb),
         "total_storage_mb": float(total_storage_mb),
+        "airborne_time_s": float(airborne_time_s),
+        "turn_time_per_line_s": float(turn_time_per_line_s),
+        "total_turn_time_s": float(total_turn_time_s),
         "flight_time_s": float(flight_time_s),
         "flight_azimuth_deg": float(flight_azimuth_deg),
         "lead_in_out_m": float(lead_in_out_m),
@@ -2252,6 +2260,15 @@ else:
             key="aoi_lead_in_out_display",
         )
         lead_in_out_m = unit_to_m(lead_in_out_display, dist_unit)
+        turn_time_per_line_min = st.number_input(
+            "Turn time between runs (min)",
+            min_value=0.0,
+            max_value=60.0,
+            value=4.0,
+            step=0.5,
+            key="aoi_turn_time_per_line_min",
+            help="Allowance added between consecutive flight runs.",
+        )
 
     if aoi_payload is not None:
         mission_outputs = compute_aoi_mission_outputs(
@@ -2262,6 +2279,7 @@ else:
             enabled_cameras=active,
             flight_azimuth_deg=flight_azimuth_deg,
             lead_in_out_m=lead_in_out_m,
+            turn_time_per_line_min=turn_time_per_line_min,
         )
 
     if mission_outputs is not None:
@@ -2275,11 +2293,12 @@ else:
         m5.metric("Total line length (km)", f"{mission_outputs['total_line_length_m'] / 1000.0:,.2f}")
         m6.metric("Avg line length (km)", f"{mission_outputs['average_line_length_m'] / 1000.0:,.2f}")
         m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
-        m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 60.0:.1f} min")
+        m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 3600.0:.2f} hr")
 
         st.caption(
             f"Frames per camera = {mission_outputs['frames_per_camera']}. Total images assumes {len(active)} enabled camera(s) fire at each trigger event. "
-            f"Storage is a rough estimate using about 1 MB per megapixel per image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line."
+            f"Storage is a rough estimate using about 1 MB per megapixel per image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
+            f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs."
         )
 
         aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit)
@@ -2315,8 +2334,6 @@ for cam, sol, _ in solutions:
     "Tilt horiz °":              round(tilt_h, 1),
 
     # ── Oblique angles ──
-    "Inner edge oblique °":      round(sol.near_angle_deg, 2),
-    "Outer edge oblique °":      round(sol.far_angle_deg, 2),
     "Near oblique angle":        format_oblique(sol.near_angle_deg),
     "Far oblique angle":         format_oblique(sol.far_angle_deg),
     # ─────────────────────
