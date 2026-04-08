@@ -1472,7 +1472,10 @@ def ensure_aoi_library_dir():
 
 def list_library_kmls():
     ensure_aoi_library_dir()
-    return sorted(AOI_LIBRARY_DIR.glob("*.kml"), key=lambda p: p.name.lower())
+    return sorted(
+        [p for p in AOI_LIBRARY_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".kml"],
+        key=lambda p: p.name.lower(),
+    )
 
 
 def kml_ring_to_lonlat(coords_text):
