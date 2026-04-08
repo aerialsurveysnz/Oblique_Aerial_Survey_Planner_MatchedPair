@@ -25,6 +25,7 @@ from pathlib import Path
 import io
 from datetime import datetime
 from itertools import product
+from xml.etree import ElementTree as ET
 
 import matplotlib
 matplotlib.use("Agg")
@@ -34,19 +35,22 @@ import matplotlib.colors as mcolors
 import numpy as np
 import streamlit as st
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.shared import Inches, Pt
 try:
-    from shapely.geometry import Polygon as ShapelyPolygon, box as shapely_box
+    from shapely.geometry import Polygon as ShapelyPolygon, box as shapely_box, LineString as ShapelyLineString
     from shapely.ops import unary_union
-    from shapely.affinity import translate as shapely_translate
+    from shapely.affinity import translate as shapely_translate, rotate as shapely_rotate
     SHAPELY_AVAILABLE = True
 except Exception:
     ShapelyPolygon = None
     shapely_box = None
+    ShapelyLineString = None
     unary_union = None
     shapely_translate = None
+    shapely_rotate = None
     SHAPELY_AVAILABLE = False
 
 from geometry_matched_pair import (
@@ -132,6 +136,7 @@ DEFAULT_CAMERAS = [
 
 PRESET_FILE = Path("presets.json")
 SCENARIO_DIR = Path("saved_scenarios")
+AOI_LIBRARY_DIR = Path("aoi_library")
 DEFAULT_ALTITUDE_M = 600.0
 DEFAULT_SPEED_MS = 62.0
 DEFAULT_SPEED_KTS = DEFAULT_SPEED_MS * 1.94384
@@ -407,7 +412,32 @@ def find_report_logo():
     return None
 
 
-def make_excel_export(settings_rows, system_rows, camera_rows):
+def build_mission_export_rows(mission_outputs, dist_unit="m"):
+    if mission_outputs is None:
+        return []
+    area_km2 = float(mission_outputs.get("area_m2", 0.0)) / 1_000_000.0
+    total_line_km = float(mission_outputs.get("total_line_length_m", 0.0)) / 1000.0
+    avg_line_km = float(mission_outputs.get("average_line_length_m", 0.0)) / 1000.0
+    return [
+        ["AOI name", mission_outputs.get("name", "AOI")],
+        ["AOI source", mission_outputs.get("source", "unknown")],
+        ["AOI area", f"{area_km2:.1f} km²"],
+        ["Flight azimuth", f"{float(mission_outputs.get('flight_azimuth_deg', 0.0)):.1f}°"],
+        ["Lead-in / out per line", f"{m_to_unit(float(mission_outputs.get('lead_in_out_m', 0.0)), dist_unit):.0f} {dist_unit}"],
+        ["Flight lines", int(mission_outputs.get("line_count", 0))],
+        ["Trigger events", int(mission_outputs.get("trigger_events", 0))],
+        ["Frames per camera", int(mission_outputs.get("frames_per_camera", 0))],
+        ["Total images", int(mission_outputs.get("total_images", 0))],
+        ["Line spacing", fmt(float(mission_outputs.get("line_spacing_m", 0.0)), dist_unit)],
+        ["Photo spacing", fmt(float(mission_outputs.get("photo_spacing_m", 0.0)), dist_unit)],
+        ["Total line length", f"{total_line_km:,.2f} km"],
+        ["Average line length", f"{avg_line_km:,.2f} km"],
+        ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
+        ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 60.0:.1f} min"],
+    ]
+
+
+def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None):
     wb = Workbook()
 
     ws1 = wb.active
@@ -439,13 +469,27 @@ def make_excel_export(settings_rows, system_rows, camera_rows):
     for row in camera_rows:
         ws3.append(row)
 
+    if mission_rows:
+        ws4 = wb.create_sheet("Sample Area")
+        ws4.append(["Metric", "Value"])
+        for row in mission_rows:
+            ws4.append(row)
+        if mission_figure_bytes:
+            try:
+                img = XLImage(io.BytesIO(mission_figure_bytes))
+                img.width = 520
+                img.height = 390
+                ws4.add_image(img, "D2")
+            except Exception:
+                pass
+
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
     return bio.getvalue()
 
 
-def make_word_export(settings_rows, system_rows, camera_rows, report_figures=None):
+def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None, report_figures=None):
     doc = Document()
 
     section = doc.sections[0]
@@ -487,6 +531,22 @@ def make_word_export(settings_rows, system_rows, camera_rows, report_figures=Non
         row[0].text = str(item)
         row[1].text = str(value)
 
+    if mission_rows:
+        doc.add_heading("Sample area and flight plan", level=2)
+        mission_table = doc.add_table(rows=1, cols=2)
+        set_table_style(mission_table, "Light Grid Accent 1")
+        hdr_m = mission_table.rows[0].cells
+        hdr_m[0].text = "Metric"
+        hdr_m[1].text = "Value"
+        for item, value in mission_rows:
+            row = mission_table.add_row().cells
+            row[0].text = str(item)
+            row[1].text = str(value)
+        if mission_figure_bytes:
+            title_p = doc.add_paragraph("Sample area and generated flight lines")
+            title_p.paragraph_format.keep_with_next = True
+            doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(5.8))
+
     doc.add_heading("Camera results", level=2)
     table2 = doc.add_table(rows=1, cols=13)
     set_table_style(table2, "Medium Grid 1 Accent 1")
@@ -518,13 +578,15 @@ def make_word_export(settings_rows, system_rows, camera_rows, report_figures=Non
     if report_figures:
         doc.add_heading("Coverage diagrams", level=2)
         for figure_title, figure_bytes in report_figures:
-            doc.add_paragraph(figure_title)
-            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(9.2))
+            para = doc.add_paragraph(figure_title)
+            para.paragraph_format.keep_with_next = True
+            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(6.7))
 
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio.getvalue()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state
@@ -552,6 +614,10 @@ if "camera_widget_nonce" not in st.session_state:
     st.session_state.camera_widget_nonce = 0
 if "pending_optimizer_apply" not in st.session_state:
     st.session_state.pending_optimizer_apply = None
+if "selected_aoi_name" not in st.session_state:
+    st.session_state.selected_aoi_name = None
+if "selected_aoi_payload" not in st.session_state:
+    st.session_state.selected_aoi_payload = None
 
 
 def bump_camera_widget_nonce():
@@ -1398,6 +1464,322 @@ def help_toggle(title, text, key, level="info"):
         getattr(st, level)(text)
 
 
+def ensure_aoi_library_dir():
+    AOI_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    return AOI_LIBRARY_DIR
+
+
+def list_library_kmls():
+    ensure_aoi_library_dir()
+    return sorted(AOI_LIBRARY_DIR.glob("*.kml"), key=lambda p: p.name.lower())
+
+
+def kml_ring_to_lonlat(coords_text):
+    pts = []
+    for token in str(coords_text or "").replace("\n", " ").split():
+        parts = token.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            lon = float(parts[0])
+            lat = float(parts[1])
+        except Exception:
+            continue
+        pts.append((lon, lat))
+    if len(pts) >= 3 and pts[0] != pts[-1]:
+        pts.append(pts[0])
+    return pts
+
+
+def lonlat_to_local_xy(points):
+    if not points:
+        return [], 0.0, 0.0
+    lons = [p[0] for p in points]
+    lats = [p[1] for p in points]
+    lon0 = float(sum(lons) / len(lons))
+    lat0 = float(sum(lats) / len(lats))
+    r = 6378137.0
+    cos_lat = math.cos(math.radians(lat0))
+    local = []
+    for lon, lat in points:
+        x = r * math.radians(lon - lon0) * cos_lat
+        y = r * math.radians(lat - lat0)
+        local.append((x, y))
+    return local, lon0, lat0
+
+
+def parse_kml_aoi(path):
+    if not SHAPELY_AVAILABLE:
+        raise RuntimeError("Shapely is required for AOI / mission outputs.")
+
+    raw_text = None
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            raw_text = Path(path).read_text(encoding=encoding)
+            break
+        except Exception:
+            continue
+    if raw_text is None:
+        raise RuntimeError(f"Could not read {Path(path).name}.")
+
+    try:
+        root = ET.fromstring(raw_text)
+    except Exception as exc:
+        raise RuntimeError(f"KML parse error: {exc}") from exc
+
+    coord_texts = []
+    for elem in root.iter():
+        if str(elem.tag).lower().endswith("coordinates") and (elem.text or "").strip():
+            coord_texts.append(elem.text)
+
+    polygons = []
+    for coords_text in coord_texts:
+        lonlat_ring = kml_ring_to_lonlat(coords_text)
+        if len(lonlat_ring) < 4:
+            continue
+        local_ring, _, _ = lonlat_to_local_xy(lonlat_ring)
+        try:
+            poly = ShapelyPolygon(local_ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty and poly.area > 0:
+                polygons.append(poly)
+        except Exception:
+            continue
+
+    if not polygons:
+        raise RuntimeError("No valid polygon coordinates were found in that KML.")
+
+    aoi_poly = unary_union(polygons)
+    if aoi_poly.is_empty:
+        raise RuntimeError("The KML geometry did not produce a usable AOI polygon.")
+
+    return {
+        "name": Path(path).stem,
+        "source": "kml_library",
+        "polygon": aoi_poly,
+        "area_m2": float(aoi_poly.area),
+    }
+
+
+def build_standard_aoi(area_km2=100.0):
+    if not SHAPELY_AVAILABLE:
+        raise RuntimeError("Shapely is required for AOI / mission outputs.")
+    area_m2 = max(0.01, float(area_km2)) * 1_000_000.0
+    side_m = math.sqrt(area_m2)
+    half = side_m / 2.0
+    poly = ShapelyPolygon([(-half, -half), (half, -half), (half, half), (-half, half)])
+    return {
+        "name": f"Standard {float(area_km2):.1f} km² square",
+        "source": "standard_example",
+        "polygon": poly,
+        "area_m2": float(poly.area),
+    }
+
+
+def iter_line_geometries(geom):
+    if geom is None or getattr(geom, "is_empty", True):
+        return
+    gtype = getattr(geom, "geom_type", "")
+    if gtype == "LineString":
+        yield geom
+    elif hasattr(geom, "geoms"):
+        for sub_geom in geom.geoms:
+            yield from iter_line_geometries(sub_geom)
+
+
+def estimate_camera_file_size_mb(cam):
+    bd = get_body(cam["body"])
+    megapixels = (float(bd["w_px"]) * float(bd["h_px"])) / 1_000_000.0
+    return megapixels * 1.0
+
+
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0):
+    if not SHAPELY_AVAILABLE:
+        return None
+    if aoi_payload is None:
+        return None
+    polygon = aoi_payload.get("polygon")
+    if polygon is None or getattr(polygon, "is_empty", True):
+        return None
+    if not (np.isfinite(line_spacing_m) and line_spacing_m > 0 and np.isfinite(photo_spacing_m) and photo_spacing_m > 0):
+        return None
+
+    rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
+    minx, miny, maxx, maxy = rotated.bounds
+    width = maxx - minx
+    if not np.isfinite(width) or width < 0:
+        return None
+
+    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 1)
+    offsets = [minx + i * line_spacing_m for i in range(n_candidates)]
+    pad = max(maxy - miny, 1.0) + max(float(lead_in_out_m), 0.0) + 1000.0
+
+    line_count = 0
+    total_line_length_m = 0.0
+    total_exposures = 0
+    line_lengths_m = []
+
+    for x in offsets:
+        base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
+        intersection = rotated.intersection(base_line)
+        for seg in iter_line_geometries(intersection):
+            seg_length = float(seg.length)
+            if seg_length <= 0:
+                continue
+            mission_length = seg_length + 2.0 * max(float(lead_in_out_m), 0.0)
+            line_count += 1
+            total_line_length_m += mission_length
+            line_lengths_m.append(mission_length)
+            total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
+
+    enabled_cam_count = max(1, len(enabled_cameras))
+    total_images = total_exposures * enabled_cam_count
+    per_trigger_storage_mb = sum(estimate_camera_file_size_mb(cam) for cam in enabled_cameras)
+    total_storage_mb = total_exposures * per_trigger_storage_mb
+    flight_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
+
+    mission_line_geometries = []
+    for x in offsets:
+        base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
+        intersection = rotated.intersection(base_line)
+        for seg in iter_line_geometries(intersection):
+            seg_length = float(seg.length)
+            if seg_length <= 0:
+                continue
+            coords = list(seg.coords)
+            if len(coords) < 2:
+                continue
+            start = coords[0]
+            end = coords[-1]
+            dy = end[1] - start[1]
+            seg_len = math.hypot(end[0] - start[0], dy)
+            if seg_len <= 0:
+                continue
+            extend = max(float(lead_in_out_m), 0.0)
+            ux = (end[0] - start[0]) / seg_len
+            uy = dy / seg_len
+            ext_start = (start[0] - ux * extend, start[1] - uy * extend)
+            ext_end = (end[0] + ux * extend, end[1] + uy * extend)
+            try:
+                ext_line = ShapelyLineString([ext_start, ext_end])
+                mission_line_geometries.append(
+                    shapely_rotate(ext_line, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+                )
+            except Exception:
+                continue
+
+    return {
+        "name": aoi_payload.get("name", "AOI"),
+        "source": aoi_payload.get("source", "unknown"),
+        "area_m2": float(aoi_payload.get("area_m2", polygon.area)),
+        "line_count": int(line_count),
+        "total_line_length_m": float(total_line_length_m),
+        "average_line_length_m": float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
+        "photo_spacing_m": float(photo_spacing_m),
+        "line_spacing_m": float(line_spacing_m),
+        "trigger_events": int(total_exposures),
+        "frames_per_camera": int(total_exposures),
+        "total_images": int(total_images),
+        "per_trigger_storage_mb": float(per_trigger_storage_mb),
+        "total_storage_mb": float(total_storage_mb),
+        "flight_time_s": float(flight_time_s),
+        "flight_azimuth_deg": float(flight_azimuth_deg),
+        "lead_in_out_m": float(lead_in_out_m),
+        "mission_line_geometries": mission_line_geometries,
+        "aoi_polygon": polygon,
+    }
+
+
+def make_aoi_mission_figure(mission_outputs, dist_unit="m"):
+    if mission_outputs is None:
+        return None
+    polygon = mission_outputs.get("aoi_polygon")
+    if polygon is None or getattr(polygon, "is_empty", True):
+        return None
+
+    fig, ax = dark_fig(4.2, 3.35)
+    ax.set_aspect("equal")
+
+    all_x = []
+    all_y = []
+    try:
+        minx, miny, maxx, maxy = polygon.bounds
+        all_x.extend([minx, maxx])
+        all_y.extend([miny, maxy])
+    except Exception:
+        pass
+
+    for line in mission_outputs.get("mission_line_geometries", []):
+        try:
+            x, y = line.xy
+        except Exception:
+            continue
+        all_x.extend(list(x))
+        all_y.extend(list(y))
+
+    if all_x and all_y:
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+        x_span = max(x_max - x_min, 1.0)
+        y_span = max(y_max - y_min, 1.0)
+        x_mid = 0.5 * (x_min + x_max)
+        y_mid = 0.5 * (y_min + y_max)
+        half_span = 0.5 * max(x_span, y_span)
+        pad = max(half_span * 0.12, 1.0)
+        x_lo, x_hi = x_mid - half_span - pad, x_mid + half_span + pad
+        y_lo, y_hi = y_mid - half_span - pad, y_mid + half_span + pad
+    else:
+        x_lo, x_hi, y_lo, y_hi = -1.0, 1.0, -1.0, 1.0
+
+    display_in_km = dist_unit == "m"
+    scale = 1000.0 if display_in_km else 1.0
+    axis_unit = "km" if display_in_km else dist_unit
+
+    def _sx(vals):
+        return [v / scale for v in vals]
+
+    def _plot_poly(poly, edgecolor="#58a6ff", facealpha=0.10, lw=2.0):
+        geoms = [poly] if getattr(poly, "geom_type", "") == "Polygon" else list(getattr(poly, "geoms", []))
+        for geom in geoms:
+            if getattr(geom, "is_empty", True):
+                continue
+            x, y = geom.exterior.xy
+            ax.fill(_sx(x), _sx(y), color=edgecolor, alpha=facealpha, zorder=2)
+            ax.plot(_sx(x), _sx(y), color=edgecolor, lw=lw, zorder=3)
+            for interior in getattr(geom, "interiors", []):
+                ix, iy = interior.xy
+                ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
+
+    _plot_poly(polygon)
+
+    for line in mission_outputs.get("mission_line_geometries", []):
+        try:
+            x, y = line.xy
+        except Exception:
+            continue
+        ax.plot(_sx(x), _sx(y), color="#f0c040", lw=1.5, alpha=0.95, zorder=4)
+
+    ax.set_xlim(x_lo / scale, x_hi / scale)
+    ax.set_ylim(y_lo / scale, y_hi / scale)
+
+    try:
+        from matplotlib.ticker import MaxNLocator
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune=None))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
+    except Exception:
+        pass
+
+    xt = ax.get_xticks()
+    ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
+    yt = ax.get_yticks()
+    ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt], color="#8b949e")
+    ax.set_xlabel(f"Local easting ({axis_unit})", color="#8b949e")
+    ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e")
+    ax.set_title("AOI and generated flight lines", color="#c9d1d9", fontsize=11)
+    fig.tight_layout()
+    return fig
+
 
 # Apply any scenario requested on the previous run before widgets are created.
 pending_loaded_scenario = st.session_state.get("pending_loaded_scenario")
@@ -1788,6 +2170,125 @@ if mc:
               f"{mc.forward_overlap_near*100:.0f}% / "
               f"{mc.forward_overlap_centre*100:.0f}% / "
               f"{mc.forward_overlap_far*100:.0f}%")
+
+mission_outputs = None
+aoi_fig = None
+st.markdown("---")
+st.subheader("AOI / Mission Outputs")
+help_toggle(
+    "Area-based outputs",
+    "This section turns the current line spacing and photo spacing into job-level outputs. You can use the built-in 100 km² example for like-for-like comparisons, or load a KML from the aoi_library folder on the server. Outputs are illustrative planning numbers based on clipped parallel lines across the AOI, the current photo spacing, enabled camera count and a simple RAW storage estimate of about 1 MB per megapixel per image.",
+    key="aoi_outputs_intro",
+)
+
+if not SHAPELY_AVAILABLE:
+    st.info("AOI / mission outputs require Shapely to be installed in the app environment.")
+elif not mc:
+    st.info("AOI / mission outputs are unavailable until the system spacing has been calculated.")
+else:
+    aoi_mode = st.radio(
+        "AOI source",
+        ["Standard example", "Load KML from library"],
+        horizontal=True,
+        key="aoi_source_mode",
+    )
+
+    aoi_payload = None
+    controls_left, controls_right = st.columns([2.2, 1.4])
+
+    with controls_left:
+        if aoi_mode == "Standard example":
+            example_area_km2 = st.number_input(
+                "Example AOI area (km²)",
+                min_value=1.0,
+                max_value=5000.0,
+                value=100.0,
+                step=10.0,
+                key="example_aoi_area_km2",
+            )
+            aoi_payload = build_standard_aoi(example_area_km2)
+            st.session_state.selected_aoi_payload = aoi_payload
+            st.session_state.selected_aoi_name = aoi_payload["name"]
+            st.caption("Standard example uses a square AOI so you can compare option changes on a common 100 km²-style block.")
+        else:
+            kml_files = list_library_kmls()
+            if not kml_files:
+                st.info("No KML files found yet. Add .kml files to the aoi_library folder on the server to use this option.")
+            else:
+                selected_kml = st.selectbox(
+                    "KML in aoi_library",
+                    [p.name for p in kml_files],
+                    key="selected_kml_name",
+                )
+                if st.button("Load KML", key="load_kml_button"):
+                    selected_path = next((p for p in kml_files if p.name == selected_kml), None)
+                    try:
+                        st.session_state.selected_aoi_payload = parse_kml_aoi(selected_path)
+                        st.session_state.selected_aoi_name = selected_kml
+                        st.success(f"Loaded {selected_kml}")
+                    except Exception as exc:
+                        st.session_state.selected_aoi_payload = None
+                        st.error(str(exc))
+                if st.session_state.get("selected_aoi_payload") is not None:
+                    aoi_payload = st.session_state.selected_aoi_payload
+                    st.caption(f"Loaded AOI: {st.session_state.get('selected_aoi_name', aoi_payload.get('name', 'KML'))}")
+
+    with controls_right:
+        flight_azimuth_deg = st.number_input(
+            "Flight azimuth (deg)",
+            min_value=0.0,
+            max_value=359.9,
+            value=0.0,
+            step=1.0,
+            key="aoi_flight_azimuth_deg",
+            help="Flight-line direction measured clockwise from north. 0° = north-south lines, 90° = east-west lines.",
+        )
+        lead_in_out_display = st.number_input(
+            f"Lead-in / out per line ({dist_unit})",
+            min_value=0.0,
+            max_value=m_to_unit(5000.0, dist_unit),
+            value=m_to_unit(150.0, dist_unit),
+            step=max(1.0, m_to_unit(25.0, dist_unit)),
+            key="aoi_lead_in_out_display",
+        )
+        lead_in_out_m = unit_to_m(lead_in_out_display, dist_unit)
+
+    if aoi_payload is not None:
+        mission_outputs = compute_aoi_mission_outputs(
+            aoi_payload=aoi_payload,
+            line_spacing_m=mc.recommended_line_spacing_m,
+            photo_spacing_m=mc.recommended_photo_spacing_m,
+            speed_ms=speed_ms,
+            enabled_cameras=active,
+            flight_azimuth_deg=flight_azimuth_deg,
+            lead_in_out_m=lead_in_out_m,
+        )
+
+    if mission_outputs is not None:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("AOI area", f"{mission_outputs['area_m2'] / 1_000_000.0:.1f} km²")
+        m2.metric("Flight lines", f"{mission_outputs['line_count']}")
+        m3.metric("Trigger events", f"{mission_outputs['trigger_events']}")
+        m4.metric("Total images", f"{mission_outputs['total_images']:,}")
+
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("Total line length (km)", f"{mission_outputs['total_line_length_m'] / 1000.0:,.2f}")
+        m6.metric("Avg line length (km)", f"{mission_outputs['average_line_length_m'] / 1000.0:,.2f}")
+        m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
+        m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 60.0:.1f} min")
+
+        st.caption(
+            f"Frames per camera = {mission_outputs['frames_per_camera']}. Total images assumes {len(active)} enabled camera(s) fire at each trigger event. "
+            f"Storage is a rough estimate using about 1 MB per megapixel per image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line."
+        )
+
+        aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit)
+        if aoi_fig is not None:
+            aoi_left, aoi_mid, aoi_right = st.columns([1.2, 2.6, 1.2])
+            with aoi_mid:
+                st.pyplot(aoi_fig)
+    else:
+        st.info("Select the standard example or load a KML from the library to see lines, frames, images and storage estimates.")
 
 st.markdown("---")
 
@@ -2876,9 +3377,18 @@ if coverage_fig_hits is not None:
 if coverage_fig_angles is not None:
     report_figures.append(("Point coverage heatmap - viewing angles", fig_to_png_bytes(coverage_fig_angles)))
 
+mission_rows = build_mission_export_rows(mission_outputs, dist_unit=dist_unit) if mission_outputs is not None else []
+mission_figure_bytes = fig_to_png_bytes(aoi_fig) if aoi_fig is not None else None
+
 col_exp1, col_exp2 = st.columns(2)
 with col_exp1:
-    excel_bytes = make_excel_export(settings_rows, system_rows, camera_rows)
+    excel_bytes = make_excel_export(
+        settings_rows,
+        system_rows,
+        camera_rows,
+        mission_rows=mission_rows,
+        mission_figure_bytes=mission_figure_bytes,
+    )
     st.download_button(
         label="Download Excel data report",
         data=excel_bytes,
@@ -2886,7 +3396,14 @@ with col_exp1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 with col_exp2:
-    word_bytes = make_word_export(settings_rows, system_rows, camera_rows, report_figures=report_figures)
+    word_bytes = make_word_export(
+        settings_rows,
+        system_rows,
+        camera_rows,
+        mission_rows=mission_rows,
+        mission_figure_bytes=mission_figure_bytes,
+        report_figures=report_figures,
+    )
     st.download_button(
         label="Download Word client report",
         data=word_bytes,
