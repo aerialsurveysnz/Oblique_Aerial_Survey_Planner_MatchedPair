@@ -75,7 +75,6 @@ BODY_PRESETS = {
   "Sony A7R V":        {"w_mm": 35.7, "h_mm": 23.8, "w_px": 9504, "h_px": 6336},
     "Sony A6500":        {"w_mm": 23.5,    "h_mm": 15.6,    "w_px": 6000,  "h_px": 4000},
     "Phase One iXM-100": {"w_mm": 53.4,    "h_mm": 40.0,    "w_px": 11664, "h_px": 8750},
-    "Phase One iXM-RS150F": {"w_mm": 53.4,    "h_mm": 40.0,    "w_px": 14204, "h_px": 10652},
     "Canon 5DS R":       {"w_mm": 36.0,    "h_mm": 24.0,    "w_px": 8688,  "h_px": 5792},
     "Nikon D850":        {"w_mm": 35.9,    "h_mm": 23.9,    "w_px": 8256,  "h_px": 5504},
     "Canon 760D":        {"w_mm": 22.3,    "h_mm": 14.9,    "w_px": 6000,  "h_px": 4000},
@@ -1703,6 +1702,40 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     }
 
 
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0):
+    if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
+        search_step_deg = 5.0
+    best = None
+    heading = 0.0
+    while heading < 180.0 - 1e-9:
+        candidate = compute_aoi_mission_outputs(
+            aoi_payload=aoi_payload,
+            line_spacing_m=line_spacing_m,
+            photo_spacing_m=photo_spacing_m,
+            speed_ms=speed_ms,
+            enabled_cameras=enabled_cameras,
+            flight_azimuth_deg=float(heading),
+            lead_in_out_m=lead_in_out_m,
+            turn_time_per_line_min=turn_time_per_line_min,
+        )
+        if candidate is not None:
+            key = (
+                float(candidate.get("flight_time_s", float("inf"))),
+                int(candidate.get("line_count", 0)),
+                float(candidate.get("total_line_length_m", float("inf"))),
+                float(candidate.get("flight_azimuth_deg", 0.0)),
+            )
+            if best is None or key < best[0]:
+                best = (key, candidate)
+        heading += float(search_step_deg)
+    if best is None:
+        return None
+    result = dict(best[1])
+    result["flight_direction_optimized"] = True
+    result["flight_direction_search_step_deg"] = float(search_step_deg)
+    return result
+
+
 def make_aoi_mission_figure(mission_outputs, dist_unit="m"):
     if mission_outputs is None:
         return None
@@ -2246,6 +2279,22 @@ else:
                     st.caption(f"Loaded AOI: {st.session_state.get('selected_aoi_name', aoi_payload.get('name', 'KML'))}")
 
     with controls_right:
+        optimize_flight_direction = st.checkbox(
+            "Optimize flight direction for minimum flying time",
+            value=False,
+            key="aoi_optimize_flight_direction",
+            help="Tests headings across the AOI and chooses the direction with the lowest estimated mission time, including turn time.",
+        )
+        search_step_deg = st.number_input(
+            "Heading search step (deg)",
+            min_value=1.0,
+            max_value=30.0,
+            value=5.0,
+            step=1.0,
+            key="aoi_heading_search_step_deg",
+            disabled=not optimize_flight_direction,
+            help="Smaller steps search more headings and can find a better direction, but take longer to calculate.",
+        )
         flight_azimuth_deg = st.number_input(
             "Flight azimuth (deg)",
             min_value=0.0,
@@ -2253,6 +2302,7 @@ else:
             value=0.0,
             step=1.0,
             key="aoi_flight_azimuth_deg",
+            disabled=optimize_flight_direction,
             help="Flight-line direction measured clockwise from north. 0° = north-south lines, 90° = east-west lines.",
         )
         lead_in_out_display = st.number_input(
@@ -2275,16 +2325,28 @@ else:
         )
 
     if aoi_payload is not None:
-        mission_outputs = compute_aoi_mission_outputs(
-            aoi_payload=aoi_payload,
-            line_spacing_m=mc.recommended_line_spacing_m,
-            photo_spacing_m=mc.recommended_photo_spacing_m,
-            speed_ms=speed_ms,
-            enabled_cameras=active,
-            flight_azimuth_deg=flight_azimuth_deg,
-            lead_in_out_m=lead_in_out_m,
-            turn_time_per_line_min=turn_time_per_line_min,
-        )
+        if optimize_flight_direction:
+            mission_outputs = optimize_aoi_flight_direction(
+                aoi_payload=aoi_payload,
+                line_spacing_m=mc.recommended_line_spacing_m,
+                photo_spacing_m=mc.recommended_photo_spacing_m,
+                speed_ms=speed_ms,
+                enabled_cameras=active,
+                lead_in_out_m=lead_in_out_m,
+                turn_time_per_line_min=turn_time_per_line_min,
+                search_step_deg=search_step_deg,
+            )
+        else:
+            mission_outputs = compute_aoi_mission_outputs(
+                aoi_payload=aoi_payload,
+                line_spacing_m=mc.recommended_line_spacing_m,
+                photo_spacing_m=mc.recommended_photo_spacing_m,
+                speed_ms=speed_ms,
+                enabled_cameras=active,
+                flight_azimuth_deg=flight_azimuth_deg,
+                lead_in_out_m=lead_in_out_m,
+                turn_time_per_line_min=turn_time_per_line_min,
+            )
 
     if mission_outputs is not None:
         m1, m2, m3, m4 = st.columns(4)
@@ -2299,10 +2361,17 @@ else:
         m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
         m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 3600.0:.2f} hr")
 
+        optimized_note = ""
+        if mission_outputs.get("flight_direction_optimized"):
+            optimized_note = (
+                f" Flight direction was optimized for minimum estimated mission time and selected {mission_outputs['flight_azimuth_deg']:.1f}° "
+                f"using a {float(mission_outputs.get('flight_direction_search_step_deg', 0.0)):.0f}° heading search step."
+            )
         st.caption(
             f"Frames per camera = {mission_outputs['frames_per_camera']}. Total images assumes {len(active)} enabled camera(s) fire at each trigger event. "
-            f"Storage is a rough estimate using about 1 MB per megapixel per image. Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
-            f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs."
+            f"Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
+            f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs." 
+            f"{optimized_note}"
         )
 
         aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit)
