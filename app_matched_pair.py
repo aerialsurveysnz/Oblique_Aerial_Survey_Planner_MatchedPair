@@ -75,6 +75,7 @@ BODY_PRESETS = {
   "Sony A7R V":        {"w_mm": 35.7, "h_mm": 23.8, "w_px": 9504, "h_px": 6336},
     "Sony A6500":        {"w_mm": 23.5,    "h_mm": 15.6,    "w_px": 6000,  "h_px": 4000},
     "Phase One iXM-100": {"w_mm": 53.4,    "h_mm": 40.0,    "w_px": 11664, "h_px": 8750},
+    "Phase One iXM-RS150F": {"w_mm": 53.4,    "h_mm": 40.0,    "w_px": 14204, "h_px": 10652},
     "Canon 5DS R":       {"w_mm": 36.0,    "h_mm": 24.0,    "w_px": 8688,  "h_px": 5792},
     "Nikon D850":        {"w_mm": 35.9,    "h_mm": 23.9,    "w_px": 8256,  "h_px": 5504},
     "Canon 760D":        {"w_mm": 22.3,    "h_mm": 14.9,    "w_px": 6000,  "h_px": 4000},
