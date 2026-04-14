@@ -333,22 +333,6 @@ def get_body(name):
         d = saved[name]
         return {"w_mm": d["w_mm"], "h_mm": d["h_mm"], "w_px": d["w_px"], "h_px": d["h_px"]}
     return BODY_PRESETS["Sony A7R V"]
-
-
-def geometry_orientation_for_camera(cam):
-    """Map UI orientation to the geometry convention.
-
-    In the planner UI, fore/aft cameras may be described by the client-facing
-    window view convention (rotated relative to side cameras). Internally the
-    geometry expects orientation relative to the ground axes, so along-axis
-    cameras use the opposite orientation label to represent the same physical
-    sensor rotated 90 degrees on the mounting plate.
-    """
-    orientation = str(cam.get("orientation", "portrait"))
-    if str(cam.get("tilt_axis", "across")) == "along":
-        return "portrait" if orientation == "landscape" else "landscape"
-    return orientation
-
 def get_inner_outer_angles(sol):
     return sol.near_angle_deg, sol.far_angle_deg
 
@@ -398,6 +382,26 @@ def mirror_solution_for_label(sol):
         )
 
     return sol
+
+
+def apply_tilt_axis_gsd_correction(sol, focal_length_mm: float):
+    """Use the sensor dimension in the tilt direction for diag/GSD on along-tilt cameras."""
+    if getattr(sol, "tilt_axis", "across") != "along":
+        return sol
+
+    sensor_tilt_mm = sol.sensor_along_mm
+    diag = diag_pp_to_long_edge_mm(sensor_tilt_mm, focal_length_mm)
+
+    def _gsd(slant_m: float) -> float:
+        return (sol.pixel_size_mm * slant_m * 1000.0 / diag) / 1000.0
+
+    return replace(
+        sol,
+        diag_image_mm=diag,
+        near_gsd_m=_gsd(sol.near_slant_m),
+        centre_gsd_m=_gsd(sol.centre_slant_m),
+        far_gsd_m=_gsd(sol.far_slant_m),
+    )
 def build_export_data(solutions, mc, altitude_m, speed_ms, fwd_frac, side_frac, dist_unit="m", reciprocal=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     speed_kts = speed_ms * 1.94384
@@ -755,9 +759,9 @@ def inner_outer_corners(sol):
 
     if all(np.isfinite(v) for xy in raw for v in xy):
         if sol.tilt_axis == "along":
-            if abs(nt[1]) <= abs(fb[1]):
-                return (nb, nt), (fb, ft)
-            return (fb, ft), (nb, nt)
+            if abs(nt[1]) <= abs(ft[1]):
+                return (nt, nb), (ft, fb)
+            return (ft, fb), (nt, nb)
         if abs(nt[0]) <= abs(ft[0]):
             return (nt, nb), (ft, fb)
         return (ft, fb), (nt, nb)
@@ -789,7 +793,7 @@ def inner_outer_corners(sol):
     return (inner[0], inner[1]), (outer[0], outer[1])
 
 def along_lengths_for_display(sol):
-    """Inner and outer footprint edge lengths for display."""
+    """Inner and outer along-track (or across-track for along-tilt) footprint lengths."""
     (it, ib), (ot, ob) = inner_outer_corners(sol)
     if sol.tilt_axis == "along":
         return abs(it[0] - ib[0]), abs(ot[0] - ob[0])
@@ -1240,12 +1244,12 @@ def build_solutions_for_optimizer(camera_configs, altitude_m):
                 image_w_native_px=bd["w_px"],
                 image_h_native_px=bd["h_px"],
                 focal_length_mm=cam["focal_mm"],
-                orientation=geometry_orientation_for_camera(cam),
+                orientation=cam["orientation"],
                 tilt_axis=cam["tilt_axis"],
                 label=cam["label"],
             )
             sol = mirror_solution_for_label(sol)
-            sol = replace(sol, orientation=cam["orientation"])
+            sol = apply_tilt_axis_gsd_correction(sol, cam["focal_mm"])
             solutions_local.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
         except Exception as exc:
             errors_local.append(f"{cam.get('label', 'Camera')}: {exc}")
@@ -2257,12 +2261,12 @@ for i, cam in enumerate(active):
             image_w_native_px   = bd["w_px"],
             image_h_native_px   = bd["h_px"],
             focal_length_mm     = cam["focal_mm"],
-            orientation         = geometry_orientation_for_camera(cam),
+            orientation         = cam["orientation"],
             tilt_axis           = cam["tilt_axis"],
             label               = cam["label"],
         )
         sol = mirror_solution_for_label(sol)
-        sol = replace(sol, orientation=cam["orientation"])
+        sol = apply_tilt_axis_gsd_correction(sol, cam["focal_mm"])
         solutions.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
     except Exception as e:
         errors.append(f"**{cam['label']}**: {e}")
