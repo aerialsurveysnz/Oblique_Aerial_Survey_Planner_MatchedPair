@@ -789,7 +789,23 @@ def inner_outer_corners(sol):
     return (inner[0], inner[1]), (outer[0], outer[1])
 
 def along_lengths_for_display(sol):
-    """Inner and outer footprint edge lengths for display."""
+    """Inner and outer footprint edge lengths for display.
+
+    Prefer the geometry layer's near/far edge lengths, which already account for
+    the active tilt axis correctly. Map near/far to inner/outer using the edge
+    that is closer to nadir. Fall back to corner spans only if those values are
+    unavailable.
+    """
+    near_len = float(getattr(sol, "near_length_m", float("nan")))
+    far_len = float(getattr(sol, "far_length_m", float("nan")))
+    near_edge = float(getattr(sol, "near_edge_m", float("nan")))
+    far_edge = float(getattr(sol, "far_edge_m", float("nan")))
+
+    if np.isfinite(near_len) and np.isfinite(far_len) and np.isfinite(near_edge) and np.isfinite(far_edge):
+        if abs(near_edge) <= abs(far_edge):
+            return abs(near_len), abs(far_len)
+        return abs(far_len), abs(near_len)
+
     (it, ib), (ot, ob) = inner_outer_corners(sol)
     if sol.tilt_axis == "along":
         return abs(it[0] - ib[0]), abs(ot[0] - ob[0])
