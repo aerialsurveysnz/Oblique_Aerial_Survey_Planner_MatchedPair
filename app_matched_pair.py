@@ -160,6 +160,49 @@ STORAGE_PROFILE_OPTIONS = {
     "Compressed RAW": 70.0,
 }
 
+BODY_STORAGE_PROFILE_MB = {
+    "Sony A7R V": {
+        "Uncompressed RAW": 130.0,
+        "Lossless Compressed RAW L": 82.5,
+        "Compressed RAW": 70.0,
+    },
+    "Sony A7R IV": {
+        "Uncompressed RAW": 123.0,
+        "Lossless Compressed RAW L": 76.0,
+        "Compressed RAW": 62.0,
+    },
+    "Sony A6500": {
+        "Uncompressed RAW": 43.0,
+        "Lossless Compressed RAW L": 30.0,
+        "Compressed RAW": 22.0,
+    },
+    "Phase One iXM-100": {
+        "Uncompressed RAW": 65.0,
+        "Lossless Compressed RAW L": 65.0,
+        "Compressed RAW": 65.0,
+    },
+    "Phase One iXM-RS150F": {
+        "Uncompressed RAW": 150.0,
+        "Lossless Compressed RAW L": 100.0,
+        "Compressed RAW": 100.0,
+    },
+    "Canon 5DS R": {
+        "Uncompressed RAW": 65.0,
+        "Lossless Compressed RAW L": 65.0,
+        "Compressed RAW": 65.0,
+    },
+    "Nikon D850": {
+        "Uncompressed RAW": 76.0,
+        "Lossless Compressed RAW L": 55.0,
+        "Compressed RAW": 45.0,
+    },
+    "Canon 760D": {
+        "Uncompressed RAW": 30.0,
+        "Lossless Compressed RAW L": 30.0,
+        "Compressed RAW": 30.0,
+    },
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,6 +382,26 @@ def mirror_solution_for_label(sol):
         )
 
     return sol
+
+
+def apply_tilt_axis_gsd_correction(sol, focal_length_mm: float):
+    """Use the sensor dimension in the tilt direction for diag/GSD on along-tilt cameras."""
+    if getattr(sol, "tilt_axis", "across") != "along":
+        return sol
+
+    sensor_tilt_mm = sol.sensor_along_mm
+    diag = diag_pp_to_long_edge_mm(sensor_tilt_mm, focal_length_mm)
+
+    def _gsd(slant_m: float) -> float:
+        return (sol.pixel_size_mm * slant_m * 1000.0 / diag) / 1000.0
+
+    return replace(
+        sol,
+        diag_image_mm=diag,
+        near_gsd_m=_gsd(sol.near_slant_m),
+        centre_gsd_m=_gsd(sol.centre_slant_m),
+        far_gsd_m=_gsd(sol.far_slant_m),
+    )
 def build_export_data(solutions, mc, altitude_m, speed_ms, fwd_frac, side_frac, dist_unit="m", reciprocal=True):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     speed_kts = speed_ms * 1.94384
@@ -427,6 +490,7 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
     avg_line_km = float(mission_outputs.get("average_line_length_m", 0.0)) / 1000.0
     storage_profile_label = mission_outputs.get("storage_profile_label", "Uncompressed RAW")
     storage_per_image_mb = float(mission_outputs.get("storage_per_image_mb", 130.0))
+    per_trigger_storage_mb = float(mission_outputs.get("per_trigger_storage_mb", storage_per_image_mb))
     return [
         ["AOI name", mission_outputs.get("name", "AOI")],
         ["AOI source", mission_outputs.get("source", "unknown")],
@@ -442,7 +506,8 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Total line length", f"{total_line_km:,.2f} km"],
         ["Average line length", f"{avg_line_km:,.2f} km"],
         ["Storage profile", storage_profile_label],
-        ["Storage per image", f"{storage_per_image_mb:.1f} MB/image"],
+        ["Average storage per image", f"{storage_per_image_mb:.1f} MB/image"],
+        ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
         ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr"],
@@ -693,6 +758,10 @@ def inner_outer_corners(sol):
     raw = [nt, nb, ft, fb]
 
     if all(np.isfinite(v) for xy in raw for v in xy):
+        if sol.tilt_axis == "along":
+            if abs(nt[1]) <= abs(ft[1]):
+                return (nt, nb), (ft, fb)
+            return (ft, fb), (nt, nb)
         if abs(nt[0]) <= abs(ft[0]):
             return (nt, nb), (ft, fb)
         return (ft, fb), (nt, nb)
@@ -726,6 +795,8 @@ def inner_outer_corners(sol):
 def along_lengths_for_display(sol):
     """Inner and outer along-track (or across-track for along-tilt) footprint lengths."""
     (it, ib), (ot, ob) = inner_outer_corners(sol)
+    if sol.tilt_axis == "along":
+        return abs(it[0] - ib[0]), abs(ot[0] - ob[0])
     return abs(it[1] - ib[1]), abs(ot[1] - ob[1])
 
 def safe_corners(sol):
@@ -1178,6 +1249,7 @@ def build_solutions_for_optimizer(camera_configs, altitude_m):
                 label=cam["label"],
             )
             sol = mirror_solution_for_label(sol)
+            sol = apply_tilt_axis_gsd_correction(sol, cam["focal_mm"])
             solutions_local.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
         except Exception as exc:
             errors_local.append(f"{cam.get('label', 'Camera')}: {exc}")
@@ -1603,8 +1675,23 @@ def iter_line_geometries(geom):
             yield from iter_line_geometries(sub_geom)
 
 
-def estimate_camera_file_size_mb(cam, storage_per_image_mb=130.0):
-    return float(storage_per_image_mb)
+def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
+    body_name = str(cam.get("body", "")).strip()
+    profile_map = BODY_STORAGE_PROFILE_MB.get(body_name)
+    if profile_map is not None:
+        return float(profile_map.get(storage_profile_label, profile_map.get("Uncompressed RAW", storage_per_image_mb)))
+
+    body = get_body(body_name)
+    image_w = float(body.get("w_px", 0) or 0)
+    image_h = float(body.get("h_px", 0) or 0)
+    megapixels = max((image_w * image_h) / 1_000_000.0, 1.0)
+    uncompressed_mb = 1.75 * megapixels
+    ratio = {
+        "Uncompressed RAW": 1.00,
+        "Lossless Compressed RAW L": 0.72,
+        "Compressed RAW": 0.58,
+    }.get(storage_profile_label, 1.00)
+    return float(uncompressed_mb * ratio)
 
 
 def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
@@ -1650,7 +1737,12 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
-    per_trigger_storage_mb = sum(estimate_camera_file_size_mb(cam, storage_per_image_mb=storage_per_image_mb) for cam in enabled_cameras)
+    per_camera_storage_mb = [
+        estimate_camera_file_size_mb(cam, storage_profile_label=storage_profile_label, storage_per_image_mb=storage_per_image_mb)
+        for cam in enabled_cameras
+    ]
+    per_trigger_storage_mb = sum(per_camera_storage_mb)
+    storage_per_image_mb = (per_trigger_storage_mb / enabled_cam_count) if enabled_cam_count > 0 else float(storage_per_image_mb)
     total_storage_mb = total_exposures * per_trigger_storage_mb
     airborne_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
     total_turn_time_s = max(line_count - 1, 0) * turn_time_per_line_s
@@ -2174,6 +2266,7 @@ for i, cam in enumerate(active):
             label               = cam["label"],
         )
         sol = mirror_solution_for_label(sol)
+        sol = apply_tilt_axis_gsd_correction(sol, cam["focal_mm"])
         solutions.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
     except Exception as e:
         errors.append(f"**{cam['label']}**: {e}")
@@ -2341,7 +2434,7 @@ else:
             list(STORAGE_PROFILE_OPTIONS.keys()),
             index=0,
             key="aoi_storage_profile_label",
-            help="Estimated storage per image for the selected RAW format.",
+            help="Camera-aware storage estimate. The selected profile is mapped to each enabled camera body using body-specific RAW size estimates.",
         )
         storage_per_image_mb = STORAGE_PROFILE_OPTIONS[storage_profile_label]
 
@@ -2396,7 +2489,7 @@ else:
             f"Frames per camera = {mission_outputs['frames_per_camera']}. Total images assumes {len(active)} enabled camera(s) fire at each trigger event. "
             f"Current mission spacing is {fmt(mission_outputs['line_spacing_m'], dist_unit)} by {fmt(mission_outputs['photo_spacing_m'], dist_unit)} with {m_to_unit(mission_outputs['lead_in_out_m'], dist_unit):.0f} {dist_unit} lead-in / out per line. "
             f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs. "
-            f"Storage assumes {mission_outputs.get('storage_profile_label', 'Uncompressed RAW')} at {mission_outputs.get('storage_per_image_mb', 130.0):.1f} MB/image." 
+            f"Storage assumes a camera-aware {mission_outputs.get('storage_profile_label', 'Uncompressed RAW')} estimate averaging {mission_outputs.get('storage_per_image_mb', 130.0):.1f} MB/image across the enabled cameras." 
             f"{optimized_note}"
         )
 
@@ -2786,14 +2879,24 @@ st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("Multi-Strip Plan View")
-show_nadir_multistrip = st.checkbox(
-    "Include nadir footprint in multi-strip view",
-    value=True,
-    key="show_nadir_multistrip",
-)
+ms_ctrl1, ms_ctrl2 = st.columns([1.15, 1.0])
+with ms_ctrl1:
+    show_nadir_multistrip = st.checkbox(
+        "Include nadir footprint in multi-strip view",
+        value=True,
+        key="show_nadir_multistrip",
+    )
+with ms_ctrl2:
+    multistrip_trigger_count = st.selectbox(
+        "Trigger instances to show",
+        [2, 6],
+        index=0,
+        key="multistrip_trigger_count",
+        format_func=lambda x: f"{x} triggers",
+    )
 st.caption(
-    "Three adjacent flight strips offset by the recommended line spacing. "
-    "Each strip shows two successive frame instances so both sidelap and forward overlap are visible. "
+    f"Three adjacent flight strips offset by the recommended line spacing. "
+    f"Each strip shows {multistrip_trigger_count} successive trigger instances so both sidelap and forward overlap are visible. "
     "The white hatched band shows the matched-frame cross-track sidelap between the right oblique on one strip "
     "and the left oblique on the adjacent reciprocal strip."
 )
@@ -2822,7 +2925,7 @@ if mc and multistrip_solutions:
     strip_lws = [1.6, 0.9, 0.5]
     strip_cols = ["#c9d1d9", "#6e7681", "#444"]
     strip_positions = [((i - (n_strips // 2)) * line_spacing) for i in range(n_strips)]
-    frame_offsets_y = [0.0, photo_spacing]
+    frame_offsets_y = [photo_spacing * idx for idx in range(int(multistrip_trigger_count))]
 
     all_x_ms = []
     all_y_ms = []
@@ -2834,7 +2937,8 @@ if mc and multistrip_solutions:
                 if len(base_corners) != 4:
                     continue
                 corners = [(x + x_off, y + y_off) for x, y in base_corners]
-                alpha = strip_alphas[si] if frame_idx == 0 else strip_alphas[si] * 0.45
+                fade_factor = max(0.18, 1.0 - 0.18 * frame_idx)
+                alpha = strip_alphas[si] if frame_idx == 0 else strip_alphas[si] * fade_factor
                 poly = plt.Polygon(
                     corners,
                     closed=True,
@@ -2949,7 +3053,7 @@ if mc and multistrip_solutions:
     ax_ms.set_yticklabels([f"{m_to_unit(t, dist_unit):.0f}" for t in yt], color="#8b949e")
     ax_ms.set_xlabel(f"← Across-track ({dist_unit}) →", color="#8b949e")
     ax_ms.set_ylabel(f"↑ Along-track ({dist_unit})", color="#8b949e")
-    ax_ms.set_title("Multi-Strip Plan View (3 strips, 2 frame instances)", color="#c9d1d9", fontsize=11)
+    ax_ms.set_title(f"Multi-Strip Plan View (3 strips, {int(multistrip_trigger_count)} trigger instances)", color="#c9d1d9", fontsize=11)
 
     legend_ms = [mpatches.Patch(color=col, label=cam["label"], alpha=0.8)
                  for cam, _, col in multistrip_solutions]
