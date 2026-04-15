@@ -103,18 +103,16 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-
 # ---------------------------------------------------------------------------
 # Unit helpers
 # ---------------------------------------------------------------------------
 
 def m_to_unit(value_m: float, unit: str) -> float:
     """Convert metres to the requested display unit."""
-    factors = {"m": 1.0, "ft": 3.28084, "cm": 100.0, "mm": 1000.0}
+    factors = {"m": 1.0, "ft": 3.280839895, "cm": 100.0, "mm": 1000.0}
     if unit not in factors:
         raise ValueError(f"Unknown unit {unit!r}. Use: m, ft, cm, mm.")
     return value_m * factors[unit]
-
 
 def unit_to_m(value: float, unit: str) -> float:
     """Convert from display unit to metres."""
@@ -123,11 +121,9 @@ def unit_to_m(value: float, unit: str) -> float:
         raise ValueError(f"Unknown unit {unit!r}. Use: m, ft, cm, mm.")
     return value * factors[unit]
 
-
 def mm_to_unit(value_mm: float, unit: str) -> float:
     """Convert millimetres to the requested display unit."""
     return m_to_unit(value_mm * 0.001, unit)
-
 
 # ---------------------------------------------------------------------------
 # Sensor / camera helpers
@@ -152,7 +148,6 @@ def pixel_size_mm(sensor_dim_mm: float, image_dim_px: int) -> float:
         raise ValueError("image_dim_px must be > 0")
     return sensor_dim_mm / image_dim_px
 
-
 def focal_length_px(focal_length_mm: float, px_size_mm: float) -> float:
     """
     Focal length in pixels.
@@ -162,7 +157,6 @@ def focal_length_px(focal_length_mm: float, px_size_mm: float) -> float:
     if px_size_mm <= 0:
         raise ValueError("px_size_mm must be > 0")
     return focal_length_mm / px_size_mm
-
 
 def normalize_tilt_angle(angle_deg: float, convention: str) -> float:
     """
@@ -183,7 +177,6 @@ def normalize_tilt_angle(angle_deg: float, convention: str) -> float:
     else:
         raise ValueError(f"Unknown convention {convention!r}. Use 'nadir' or 'horiz'.")
 
-
 def half_fov_deg(sensor_dim_mm: float, focal_length_mm: float) -> float:
     """
     Half field-of-view for one sensor axis (degrees).
@@ -191,7 +184,6 @@ def half_fov_deg(sensor_dim_mm: float, focal_length_mm: float) -> float:
         half_fov = atan(sensor_dim / (2 · focal_length))
     """
     return math.degrees(math.atan(sensor_dim_mm / (2.0 * focal_length_mm)))
-
 
 def diag_pp_to_long_edge_mm(sensor_across_mm: float, focal_length_mm: float) -> float:
     """
@@ -211,7 +203,6 @@ def diag_pp_to_long_edge_mm(sensor_across_mm: float, focal_length_mm: float) -> 
         diagonal distance in mm
     """
     return math.sqrt((sensor_across_mm / 2.0) ** 2 + focal_length_mm ** 2)
-
 
 def flying_height_for_gsd(
     target_gsd_m: float,
@@ -238,7 +229,6 @@ def flying_height_for_gsd(
     if focal_length_mm <= 0:
         raise ValueError("focal_length_mm must be > 0")
     return target_gsd_m * focal_length_mm / px_size_mm
-
 
 # ---------------------------------------------------------------------------
 # Core ray projection (exact pinhole, flat terrain)
@@ -288,7 +278,6 @@ def _project_ray(
     if r_z <= 1e-12:
         return math.copysign(float("inf"), r_x), math.copysign(float("inf"), r_y)
     return H * r_x / r_z, H * r_y / r_z
-
 
 def four_corner_footprint(
     altitude_m: float,
@@ -398,7 +387,6 @@ def four_corner_footprint(
         tilt_axis=tilt_axis,
     )
 
-
 # ---------------------------------------------------------------------------
 # Public ground-intersection dataclass and function
 # ---------------------------------------------------------------------------
@@ -424,7 +412,6 @@ class GroundIntersections:
     far_angle_deg: float     # nadir angle at far edge = atan(Gx_far / H)
     near_length_m: float     # along-track footprint at near edge (exact)
     far_length_m: float      # along-track footprint at far edge (exact)
-
 
 def ground_intersections_flat_terrain(
     altitude_m: float,
@@ -495,7 +482,6 @@ def ground_intersections_flat_terrain(
         far_length_m=fp["far_length_m"],
     )
 
-
 # ---------------------------------------------------------------------------
 # GSD (FIX 3 — slant-plane formula matching reference spreadsheet)
 # ---------------------------------------------------------------------------
@@ -534,7 +520,6 @@ def gsd_at_edge_full(
     diag_mm     = diag_pp_to_long_edge_mm(sensor_across_mm, focal_length_mm)
     return (px_size_mm_val * slant_2d_mm / diag_mm) / 1000.0  # convert mm→m
 
-
 # ---------------------------------------------------------------------------
 # Footprint dimensions dataclass
 # ---------------------------------------------------------------------------
@@ -549,7 +534,6 @@ class FootprintDimensions:
     near_edge_m: float       # across-track: near edge from nadir
     far_edge_m: float        # across-track: far edge from nadir
     centre_m: float          # across-track: image centre from nadir
-
 
 def footprint_dimensions(
     altitude_m: float,
@@ -604,7 +588,6 @@ def footprint_dimensions(
         centre_m=fp["centre_m"],
     )
 
-
 # ---------------------------------------------------------------------------
 # Swath and spacing helpers
 # ---------------------------------------------------------------------------
@@ -619,7 +602,6 @@ def effective_swath_from_sidelap(footprint_across_m: float, sidelap_fraction: fl
         raise ValueError("sidelap_fraction must be in [0, 1)")
     return footprint_across_m * (1.0 - sidelap_fraction)
 
-
 def line_spacing_from_sidelap(combined_swath_m: float, sidelap_fraction: float) -> float:
     """
     Nadir-track to nadir-track line spacing for a target sidelap.
@@ -629,7 +611,6 @@ def line_spacing_from_sidelap(combined_swath_m: float, sidelap_fraction: float) 
     Pass the full system swath (all cameras combined), not a single camera footprint.
     """
     return effective_swath_from_sidelap(combined_swath_m, sidelap_fraction)
-
 
 def photo_spacing_from_forward_overlap(
     footprint_along_m: float,
@@ -646,7 +627,6 @@ def photo_spacing_from_forward_overlap(
     if not 0.0 <= forward_overlap_fraction < 1.0:
         raise ValueError("forward_overlap_fraction must be in [0, 1)")
     return footprint_along_m * (1.0 - forward_overlap_fraction)
-
 
 # ---------------------------------------------------------------------------
 # Per-camera complete solution
@@ -697,6 +677,30 @@ class CameraSolution:
     corner_far_top: tuple
     corner_far_bot: tuple
 
+def _physical_to_solver_orientation(physical_orientation: str, tilt_axis: str) -> str:
+    """Map physical (flight-line-relative) orientation to solver orientation.
+
+    The solver's 'portrait'/'landscape' labels describe which sensor dimension
+    faces across-track *from the solver's perspective* (i.e. relative to the
+    tilt axis).  For fore/aft cameras (tilt_axis='along') the camera body is
+    physically rotated 90° to face fore/aft, which swaps which dimension is
+    across-track from the solver's point of view.
+
+    Physical orientation (relative to LINE OF FLIGHT):
+        'portrait'  — short sensor side across the line of flight
+        'landscape' — long  sensor side across the line of flight
+
+    Solver orientation (relative to TILT AXIS / sensor_across_mm):
+        'portrait'  — short side → sensor_across_mm  (default for L/R across-tilt)
+        'landscape' — long  side → sensor_across_mm
+
+    Mapping:
+        L/R (across-tilt): physical == solver  (1-to-1)
+        F/A (along-tilt):  physical is flipped — portrait↔landscape
+    """
+    if tilt_axis == "along":
+        return "landscape" if physical_orientation == "portrait" else "portrait"
+    return physical_orientation
 
 def calculate_camera_solution(
     altitude_m: float,
@@ -709,54 +713,82 @@ def calculate_camera_solution(
     orientation: str = "portrait",
     tilt_axis: str = "across",
     label: str = "",
-) -> CameraSolution:
+    physical_orientation: str = None,
+) -> "CameraSolution":
     """
     Full geometry solution for a single camera.
 
-    ORIENTATION — controls which sensor dimension is across-track:
+    ORIENTATION PARAMETERS
+    ──────────────────────
+    Two ways to specify orientation — use whichever matches your coordinate frame:
 
-        'portrait'  — narrow (short) axis across-track, long axis along-track.
-                      Recommended for L/R oblique cameras.
-                      sensor_across = sensor_h_native (shorter)
-                      sensor_along  = sensor_w_native (longer)
+    physical_orientation  (preferred for multi-axis rigs):
+        Orientation relative to the LINE OF FLIGHT, independent of tilt_axis.
+        'portrait'  — short sensor side across the line of flight.
+        'landscape' — long  sensor side across the line of flight.
+        The function automatically maps this to the correct solver orientation
+        and applies the tilt-plane GSD correction internally.  This is the
+        self-consistent path — the geometry layer produces correct GSD for
+        fore/aft cameras without any patching in the caller.
 
-        'landscape' — long axis across-track, narrow axis along-track.
-                      Typical for nadir cameras.
-                      sensor_across = sensor_w_native (longer)
-                      sensor_along  = sensor_h_native (shorter)
+    orientation  (legacy / direct solver control):
+        Orientation relative to the TILT AXIS / sensor_across_mm.
+        'portrait'  — sensor_h_native (shorter) → sensor_across_mm.
+        'landscape' — sensor_w_native (longer)  → sensor_across_mm.
+        When physical_orientation is None (default) this parameter is used
+        directly as before.  The caller is then responsible for the tilt-plane
+        GSD correction if tilt_axis='along'.
 
-    TILT AXIS:
-        'across' — camera tilts left/right (about along-track Y axis). Default.
-        'along'  — camera tilts fore/aft   (about across-track X axis).
+    TILT AXIS
+    ─────────
+        'across' — camera tilts left/right (L/R oblique cameras).
+        'along'  — camera tilts fore/aft   (F/A oblique cameras).
 
     Args:
-        altitude_m          : AGL altitude in metres
-        tilt_from_nadir_deg : camera tilt from nadir in degrees
-        sensor_w_native_mm  : native LONG sensor dimension in mm (manufacturer spec)
-        sensor_h_native_mm  : native SHORT sensor dimension in mm
-        image_w_native_px   : pixel count along native width
-        image_h_native_px   : pixel count along native height
-        focal_length_mm     : focal length in mm
-        orientation         : 'portrait' or 'landscape'
-        tilt_axis           : 'across' or 'along'
-        label               : display label
+        altitude_m           : AGL altitude in metres
+        tilt_from_nadir_deg  : camera tilt from nadir in degrees (0 = straight down)
+        sensor_w_native_mm   : native LONG sensor dimension in mm (manufacturer spec)
+        sensor_h_native_mm   : native SHORT sensor dimension in mm
+        image_w_native_px    : pixel count along native width
+        image_h_native_px    : pixel count along native height
+        focal_length_mm      : focal length in mm
+        orientation          : 'portrait' or 'landscape' (solver frame — see above)
+        tilt_axis            : 'across' (L/R) or 'along' (F/A)
+        label                : display label
+        physical_orientation : 'portrait' or 'landscape' (flight-line frame — see above).
+                               When provided, overrides `orientation` and enables the
+                               built-in tilt-plane GSD correction for along-axis cameras.
 
     Returns:
-        CameraSolution dataclass
+        CameraSolution dataclass with correct GSD regardless of tilt_axis.
     """
-    # Resolve sensor dimensions based on orientation
-    if orientation == "portrait":
+    # Resolve which orientation to hand to the solver.
+    # When physical_orientation is given, map it to the solver frame.
+    use_physical = physical_orientation is not None
+    if use_physical:
+        if physical_orientation not in ("portrait", "landscape"):
+            raise ValueError(
+                f"physical_orientation must be 'portrait' or 'landscape', got {physical_orientation!r}"
+            )
+        solver_orientation = _physical_to_solver_orientation(physical_orientation, tilt_axis)
+        display_orientation = physical_orientation   # store what the user selected
+    else:
+        if orientation not in ("portrait", "landscape"):
+            raise ValueError(f"orientation must be 'portrait' or 'landscape', got {orientation!r}")
+        solver_orientation  = orientation
+        display_orientation = orientation
+
+    # Resolve sensor dimensions based on solver orientation
+    if solver_orientation == "portrait":
         sensor_across_mm  = sensor_h_native_mm   # narrow → across-track
         sensor_along_mm   = sensor_w_native_mm   # long   → along-track
         image_across_px   = image_h_native_px
         image_along_px    = image_w_native_px
-    elif orientation == "landscape":
+    else:  # landscape
         sensor_across_mm  = sensor_w_native_mm   # long   → across-track
         sensor_along_mm   = sensor_h_native_mm   # narrow → along-track
         image_across_px   = image_w_native_px
         image_along_px    = image_h_native_px
-    else:
-        raise ValueError(f"orientation must be 'portrait' or 'landscape', got {orientation!r}")
 
     gi   = ground_intersections_flat_terrain(
         altitude_m, tilt_from_nadir_deg,
@@ -775,16 +807,29 @@ def calculate_camera_solution(
     )
 
     px_sz = pixel_size_mm(sensor_across_mm, image_across_px)
-    diag  = diag_pp_to_long_edge_mm(sensor_across_mm, focal_length_mm)
 
-    near_gsd   = gsd_at_edge_full(altitude_m, gi.near_edge_m,  px_sz, focal_length_mm, sensor_across_mm)
-    centre_gsd = gsd_at_edge_full(altitude_m, gi.centre_m,     px_sz, focal_length_mm, sensor_across_mm)
-    far_gsd    = gsd_at_edge_full(altitude_m, gi.far_edge_m,   px_sz, focal_length_mm, sensor_across_mm)
+    # Tilt-plane diagonal: for the slant-plane GSD formula, use the sensor
+    # dimension that lies in the tilt plane.
+    # - across-tilt cameras: tilt plane is across-track → use sensor_across_mm.
+    # - along-tilt cameras:  tilt plane is along-track  → use sensor_along_mm.
+    # When physical_orientation is supplied the solver orientation has already been
+    # flipped so sensor_along_mm is the tilt-plane dimension for F/A cameras.
+    # When using legacy orientation= the caller is responsible (or must patch later).
+    tilt_plane_sensor_mm = sensor_across_mm if tilt_axis == "across" else sensor_along_mm
+    diag = diag_pp_to_long_edge_mm(tilt_plane_sensor_mm, focal_length_mm)
+
+    def _gsd(ground_dist_m: float) -> float:
+        slant_mm = math.sqrt(altitude_m ** 2 + ground_dist_m ** 2) * 1000.0
+        return (px_sz * slant_mm / diag) / 1000.0
+
+    near_gsd   = _gsd(gi.near_edge_m)
+    centre_gsd = _gsd(gi.centre_m)
+    far_gsd    = _gsd(gi.far_edge_m)
 
     return CameraSolution(
         label=label,
         tilt_from_nadir_deg=tilt_from_nadir_deg,
-        orientation=orientation,
+        orientation=display_orientation,
         tilt_axis=tilt_axis,
         pixel_size_mm=px_sz,
         sensor_across_mm=sensor_across_mm,
@@ -818,15 +863,11 @@ def calculate_camera_solution(
         corner_far_bot=fcfp["far_bot"],
     )
 
-
-
-
 def _matched_rl_pair(camera_solutions):
     """Return (right_sol, left_sol) across-track pair if available, else (None, None)."""
     right = next((cs for cs in camera_solutions if cs.tilt_axis == "across" and "right" in (cs.label or "").lower()), None)
     left = next((cs for cs in camera_solutions if cs.tilt_axis == "across" and "left" in (cs.label or "").lower()), None)
     return right, left
-
 
 def _polygon_extent_x(cs):
     xs = [cs.corner_near_top[0], cs.corner_near_bot[0], cs.corner_far_top[0], cs.corner_far_bot[0]]
@@ -834,7 +875,6 @@ def _polygon_extent_x(cs):
     if not finite_xs:
         return None
     return min(finite_xs), max(finite_xs)
-
 
 def _matched_rl_overlap_fraction(right_sol, left_sol, line_spacing):
     """
@@ -852,7 +892,6 @@ def _matched_rl_overlap_fraction(right_sol, left_sol, line_spacing):
     overlap_width = max(0.0, band_x1 - band_x0)
     right_width = max(1e-9, r_x1 - r_x0)
     return max(0.0, min(1.0, overlap_width / right_width))
-
 
 def _line_spacing_for_matched_rl(right_sol, left_sol, target_overlap_fraction):
     """
@@ -948,7 +987,6 @@ def _line_spacing_for_matched_rl(right_sol, left_sol, target_overlap_fraction):
             hi_desc = mid
     return 0.5 * (lo + hi_desc)
 
-
 # ---------------------------------------------------------------------------
 # Multi-camera system solution
 # ---------------------------------------------------------------------------
@@ -966,7 +1004,6 @@ class MultiCameraSolution:
     sidelap_achieved: float             # system-level sidelap (fraction)
     reciprocal_recommended: bool
     warnings: List[str] = field(default_factory=list)
-
 
 def calculate_multicamera_solution(
     camera_solutions: list,
@@ -1023,8 +1060,11 @@ def calculate_multicamera_solution(
         line_spacing = line_spacing_from_sidelap(combined_swath, sidelap_fraction)
         sidelap_achieved = 1.0 - line_spacing / combined_swath if combined_swath > 0 else 0.0
 
-    # Photo spacing — use near_length_m for the conservative (minimum footprint) estimate
-    near_along = camera_solutions[0].near_length_m
+    # Photo spacing — use the smallest near_length_m across ALL cameras so the
+    # target forward overlap is met at the most constrained position regardless
+    # of camera order.  Using camera_solutions[0] was a bug: reordering cameras
+    # changed the recommended spacing.
+    near_along = min(cs.near_length_m for cs in camera_solutions)
     photo_spacing = photo_spacing_from_forward_overlap(near_along, forward_overlap_fraction)
     photo_interval_s = photo_spacing / aircraft_speed_ms if aircraft_speed_ms > 0 else float("inf")
 
@@ -1033,9 +1073,10 @@ def calculate_multicamera_solution(
             return 0.0
         return max(0.0, min(1.0, 1.0 - photo_spacing / fp_m))
 
-    fwd_near   = _overlap(camera_solutions[0].near_length_m)
-    fwd_centre = _overlap(camera_solutions[0].centre_length_m)
-    fwd_far    = _overlap(camera_solutions[0].far_length_m)
+    # Report achieved forward overlap at the tightest (minimum) footprint across all cameras.
+    fwd_near   = min(_overlap(cs.near_length_m)   for cs in camera_solutions)
+    fwd_centre = min(_overlap(cs.centre_length_m) for cs in camera_solutions)
+    fwd_far    = min(_overlap(cs.far_length_m)    for cs in camera_solutions)
 
     reciprocal_recommended = any(abs(cs.centre_angle_deg) > 5.0 for cs in camera_solutions)
 

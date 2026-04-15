@@ -89,6 +89,10 @@ from geometry_matched_pair import (
 
 CAM_COLOURS = ["#58a6ff", "#f85149", "#3fb950", "#d29922", "#bc8cff", "#39c5cf"]
 
+# Label token sets used to detect fore/aft and left/right cameras for warnings/mirroring.
+_FA_TOKENS = ["fore", "forward", "front", "aft", "rear", "back"]
+_LR_TOKENS = ["left", "right"]
+
 BODY_PRESETS = {
     "Sony A7R IV":       {"w_mm": 35.7,    "h_mm": 23.8,    "w_px": 9504,  "h_px": 6336},
   "Sony A7R V":        {"w_mm": 35.7, "h_mm": 23.8, "w_px": 9504, "h_px": 6336},
@@ -355,72 +359,20 @@ def get_body(name):
 
 
 def geometry_orientation_for_camera(cam):
-    """Map the user-selected physical orientation to the geometry-solver orientation.
-
-    The user selects orientation relative to the LINE OF FLIGHT:
-        portrait  = camera held so the SHORT side faces across-track
-                    (long side along the flight line)
-        landscape = camera held so the LONG side faces across-track
-                    (short side along the flight line)
-
-    The geometry solver uses orientation relative to the TILT AXIS:
-        portrait  → narrow (short) sensor axis is sensor_across_mm
-        landscape → wide (long)   sensor axis is sensor_across_mm
-
-    For LEFT/RIGHT cameras (tilt_axis='across') the across-track direction
-    matches the physical across-track direction, so the mapping is 1-to-1:
-        user portrait  → solver portrait  (short axis across-track)
-        user landscape → solver landscape (long axis across-track)
-
-    For FORE/AFT cameras (tilt_axis='along') the camera body is physically
-    rotated 90° relative to the flight line so its tilt plane faces fore/aft.
-    This rotation swaps which sensor dimension faces across-track vs along-track:
-        user portrait  (short side across-track physically)
-                       → the LONG sensor dimension now faces across-track
-                          from the solver's perspective
-                       → solver orientation = 'landscape'
-        user landscape (long side across-track physically)
-                       → the SHORT sensor dimension now faces across-track
-                          from the solver's perspective
-                       → solver orientation = 'portrait'
-
-    In summary: for along-tilt (fore/aft) cameras the orientation is flipped
-    before being passed to the geometry solver so that sensor_across_mm always
-    contains the dimension that physically faces across the line of flight.
-    """
+    """Deprecated — orientation mapping now handled inside calculate_camera_solution()
+    via the physical_orientation parameter.  Retained only for any legacy call sites."""
     user_orient = str(cam.get("orientation", "portrait"))
     tilt_axis   = str(cam.get("tilt_axis",   "across"))
-
     if tilt_axis == "along":
-        # Fore/aft cameras are rotated 90° — swap the orientation mapping
         return "landscape" if user_orient == "portrait" else "portrait"
-
-    # Left/right (across-tilt) cameras: direct mapping
     return user_orient
 
 
 def apply_active_tilt_plane_gsd(sol, focal_length_mm: float):
-    """Recompute diagonal image distance and GSD using the active tilt plane.
-
-    The geometry module already returns the correct footprint and slant values for
-    both across- and along-tilt cameras. The remaining mismatch for rotated rigs
-    comes from using sensor_across_mm in the slant-plane diagonal term for every
-    camera. For fore/aft cameras, the active tilt plane is the along-track sensor
-    dimension, so use sensor_along_mm there.
-    """
-    sensor_tilt_plane_mm = sol.sensor_across_mm if sol.tilt_axis == "across" else sol.sensor_along_mm
-    diag_image_mm = math.sqrt((sensor_tilt_plane_mm / 2.0) ** 2 + float(focal_length_mm) ** 2)
-
-    def _gsd_from_slant(slant_m: float) -> float:
-        return (sol.pixel_size_mm * float(slant_m) * 1000.0 / diag_image_mm) / 1000.0
-
-    return replace(
-        sol,
-        diag_image_mm=diag_image_mm,
-        near_gsd_m=_gsd_from_slant(sol.near_slant_m),
-        centre_gsd_m=_gsd_from_slant(sol.centre_slant_m),
-        far_gsd_m=_gsd_from_slant(sol.far_slant_m),
-    )
+    """Deprecated — tilt-plane GSD correction is now applied inside
+    calculate_camera_solution() when physical_orientation is passed.
+    Retained as a no-op pass-through so any remaining call sites do not break."""
+    return sol
 
 def get_inner_outer_angles(sol):
     return sol.near_angle_deg, sol.far_angle_deg
@@ -1313,33 +1265,45 @@ def apply_common_oblique_settings(camera_configs, tilt_deg=None, focal_mm=None):
     return camera_configs
 
 
-def build_solutions_for_optimizer(camera_configs, altitude_m):
-    active_local = [dict(c) for c in camera_configs if c.get("enabled", False)]
-    solutions_local = []
-    errors_local = []
-    for i, cam in enumerate(active_local):
+def _build_camera_solutions(camera_configs, altitude_m):
+    """Build (cam_dict, CameraSolution, colour) triples for a list of camera configs.
+
+    Passes physical_orientation to calculate_camera_solution() so that the geometry
+    layer handles the across/along orientation mapping and tilt-plane GSD correction
+    internally.  No post-hoc patching is needed in the app layer.
+
+    Returns:
+        (solutions, errors) — errors is a list of human-readable strings.
+    """
+    active = [dict(c) for c in camera_configs if c.get("enabled", False)]
+    solutions_out = []
+    errors_out = []
+    for i, cam in enumerate(active):
         try:
-            bd = get_body(cam["body"])
+            bd     = get_body(cam["body"])
             tilt_n = normalize_tilt_angle(cam["tilt_deg"], cam["tilt_conv"])
-            sol = calculate_camera_solution(
-                altitude_m=altitude_m,
-                tilt_from_nadir_deg=tilt_n,
-                sensor_w_native_mm=bd["w_mm"],
-                sensor_h_native_mm=bd["h_mm"],
-                image_w_native_px=bd["w_px"],
-                image_h_native_px=bd["h_px"],
-                focal_length_mm=cam["focal_mm"],
-                orientation=geometry_orientation_for_camera(cam),
-                tilt_axis=cam["tilt_axis"],
-                label=cam["label"],
+            sol    = calculate_camera_solution(
+                altitude_m           = altitude_m,
+                tilt_from_nadir_deg  = tilt_n,
+                sensor_w_native_mm   = bd["w_mm"],
+                sensor_h_native_mm   = bd["h_mm"],
+                image_w_native_px    = bd["w_px"],
+                image_h_native_px    = bd["h_px"],
+                focal_length_mm      = cam["focal_mm"],
+                tilt_axis            = cam["tilt_axis"],
+                label                = cam["label"],
+                physical_orientation = cam["orientation"],   # geometry layer handles the rest
             )
             sol = mirror_solution_for_label(sol)
-            sol = apply_active_tilt_plane_gsd(sol, cam["focal_mm"])
-            sol = replace(sol, orientation=cam["orientation"])
-            solutions_local.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
+            solutions_out.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
         except Exception as exc:
-            errors_local.append(f"{cam.get('label', 'Camera')}: {exc}")
-    return solutions_local, errors_local
+            errors_out.append(f"{cam.get('label', 'Camera')}: {exc}")
+    return solutions_out, errors_out
+
+
+def build_solutions_for_optimizer(camera_configs, altitude_m):
+    """Wrapper retained for back-compatibility; delegates to _build_camera_solutions."""
+    return _build_camera_solutions(camera_configs, altitude_m)
 
 
 def optimizer_penalty(candidate, requirements):
@@ -2337,39 +2301,13 @@ st.markdown("---")
 
 active = [c for c in cameras if c["enabled"]]
 
-solutions = []   # list of (cam_dict, CameraSolution, colour_str)
-errors    = []
-
-for i, cam in enumerate(active):
-    try:
-        bd     = get_body(cam["body"])
-        tilt_n = normalize_tilt_angle(cam["tilt_deg"], cam["tilt_conv"])
-        sol    = calculate_camera_solution(
-            altitude_m          = altitude_m,
-            tilt_from_nadir_deg = tilt_n,
-            sensor_w_native_mm  = bd["w_mm"],
-            sensor_h_native_mm  = bd["h_mm"],
-            image_w_native_px   = bd["w_px"],
-            image_h_native_px   = bd["h_px"],
-            focal_length_mm     = cam["focal_mm"],
-            orientation         = geometry_orientation_for_camera(cam),
-            tilt_axis           = cam["tilt_axis"],
-            label               = cam["label"],
-        )
-        sol = mirror_solution_for_label(sol)
-        sol = apply_active_tilt_plane_gsd(sol, cam["focal_mm"])
-        sol = replace(sol, orientation=cam["orientation"])
-        solutions.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
-    except Exception as e:
-        errors.append(f"**{cam['label']}**: {e}")
+solutions, errors = _build_camera_solutions(active, altitude_m)
 
 for e in errors:
     st.error(e)
 
 # Warn when a camera label suggests fore/aft but tilt-axis is Across (L/R), or vice versa.
 # These combinations produce footprints projecting in the wrong direction.
-_FA_TOKENS = ["fore", "forward", "front", "aft", "rear", "back"]
-_LR_TOKENS = ["left", "right"]
 for _cam, _sol, _ in solutions:
     _lbl = (_sol.label or "").lower()
     _is_fa = any(t in _lbl for t in _FA_TOKENS)
@@ -2442,37 +2380,37 @@ if mc:
 st.markdown("---")
 st.subheader("Per-Camera Results")
 
-_rows = []
-for _cam, _sol, _ in solutions:
-    _inner_gx, _outer_gx = corner_inner_outer(_sol)
-    _inner_len, _outer_len = along_lengths_for_display(_sol)
-    _inner_gsd = min(_sol.near_gsd_m, _sol.far_gsd_m)
-    _outer_gsd = max(_sol.near_gsd_m, _sol.far_gsd_m)
-    _tilt_h = 90.0 - _sol.tilt_from_nadir_deg
-    _rows.append({
-        "Camera":                      _sol.label,
-        "Body / FL":                   f"{_cam['body']}  {_cam['focal_mm']:.0f} mm",
-        "Orient.":                     _sol.orientation,
-        "Tilt axis":                   _sol.tilt_axis,
-        "Tilt nadir °":           round(_sol.tilt_from_nadir_deg, 1),
-        "Tilt horiz °":           round(_tilt_h, 1),
-        "Near oblique angle":          format_oblique(_sol.near_angle_deg),
-        "Far oblique angle":           format_oblique(_sol.far_angle_deg),
-        "Pixel µm":              round(_sol.pixel_size_mm * 1000, 2),
-        "FOV across °":          round(_sol.full_fov_along_deg   if _sol.tilt_axis == "along" else _sol.full_fov_across_deg, 2),
-        "FOV along °":           round(_sol.full_fov_across_deg  if _sol.tilt_axis == "along" else _sol.full_fov_along_deg,  2),
-        f"Inner edge ({dist_unit})":   round(m_to_unit(abs(_inner_gx), dist_unit), 1),
-        f"Outer edge ({dist_unit})":   round(m_to_unit(abs(_outer_gx), dist_unit), 1),
-        f"Inner length ({dist_unit})": round(m_to_unit(_inner_len, dist_unit), 1),
-        f"Outer length ({dist_unit})": round(m_to_unit(_outer_len, dist_unit), 1),
-        "Inner GSD cm":                round(_inner_gsd * 100, 3),
-        "Centre GSD cm":               round(_sol.centre_gsd_m * 100, 3),
-        "Outer GSD cm":                round(_outer_gsd * 100, 3),
-        "Inner slant m":               round(min(_sol.near_slant_m, _sol.far_slant_m), 1),
-        "Outer slant m":               round(max(_sol.near_slant_m, _sol.far_slant_m), 1),
-        "Diag image mm":               round(_sol.diag_image_mm, 4),
+rows = []
+for cam, sol, _ in solutions:
+    inner_gx, outer_gx = corner_inner_outer(sol)
+    inner_len, outer_len = along_lengths_for_display(sol)
+    inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
+    outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+    tilt_h = 90.0 - sol.tilt_from_nadir_deg
+    rows.append({
+        "Camera":                      sol.label,
+        "Body / FL":                   f"{cam['body']}  {cam['focal_mm']:.0f} mm",
+        "Orient.":                     sol.orientation,
+        "Tilt axis":                   sol.tilt_axis,
+        "Tilt nadir °":           round(sol.tilt_from_nadir_deg, 1),
+        "Tilt horiz °":           round(tilt_h, 1),
+        "Near oblique angle":          format_oblique(sol.near_angle_deg),
+        "Far oblique angle":           format_oblique(sol.far_angle_deg),
+        "Pixel µm":              round(sol.pixel_size_mm * 1000, 2),
+        "FOV across °":          round(sol.full_fov_along_deg   if sol.tilt_axis == "along" else sol.full_fov_across_deg, 2),
+        "FOV along °":           round(sol.full_fov_across_deg  if sol.tilt_axis == "along" else sol.full_fov_along_deg,  2),
+        f"Inner edge ({dist_unit})":   round(m_to_unit(abs(inner_gx), dist_unit), 1),
+        f"Outer edge ({dist_unit})":   round(m_to_unit(abs(outer_gx), dist_unit), 1),
+        f"Inner length ({dist_unit})": round(m_to_unit(inner_len, dist_unit), 1),
+        f"Outer length ({dist_unit})": round(m_to_unit(outer_len, dist_unit), 1),
+        "Inner GSD cm":                round(inner_gsd * 100, 3),
+        "Centre GSD cm":               round(sol.centre_gsd_m * 100, 3),
+        "Outer GSD cm":                round(outer_gsd * 100, 3),
+        "Inner slant m":               round(min(sol.near_slant_m, sol.far_slant_m), 1),
+        "Outer slant m":               round(max(sol.near_slant_m, sol.far_slant_m), 1),
+        "Diag image mm":               round(sol.diag_image_mm, 4),
     })
-st.dataframe(_rows, width="stretch")
+st.dataframe(rows, width="stretch")
 st.caption(
     "**Near/Far oblique angle** = angle from vertical (nadir) at the inner and outer image edges. "
     "Higher angles mean a stronger oblique view."
