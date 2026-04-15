@@ -2604,8 +2604,10 @@ for cam, sol, _ in solutions:
     # ─────────────────────
 
     "Pixel µm":                  round(sol.pixel_size_mm * 1000, 2),
-    "FOV across °":              round(sol.full_fov_across_deg, 2),
-    "FOV along °":               round(sol.full_fov_along_deg,  2),
+    # For along-tilt (fore/aft) cameras the solver receives a swapped orientation
+    # so its fov_across/fov_along fields are physically transposed — swap back for display.
+    "FOV across °":              round(sol.full_fov_along_deg   if sol.tilt_axis == "along" else sol.full_fov_across_deg, 2),
+    "FOV along °":               round(sol.full_fov_across_deg  if sol.tilt_axis == "along" else sol.full_fov_along_deg,  2),
     f"Inner edge ({dist_unit})": round(m_to_unit(abs(inner_gx), dist_unit), 1),
     f"Outer edge ({dist_unit})": round(m_to_unit(abs(outer_gx), dist_unit), 1),
     f"Inner length ({dist_unit})": round(m_to_unit(inner_len, dist_unit), 1),
@@ -3728,13 +3730,13 @@ with st.expander("Show intermediate calculations per camera", expanded=False):
 | Quantity | Formula | Value |
 |---|---|---|
 | Sensor native | — | {bd['w_mm']} × {bd['h_mm']} mm, {bd['w_px']} × {bd['h_px']} px |
-| Orientation | **{sol.orientation}** | across: **{sol.sensor_across_mm:.4f} mm**, along: **{sol.sensor_along_mm:.4f} mm** |
+| Orientation | **{sol.orientation}** | across: **{(sol.sensor_along_mm if sol.tilt_axis == "along" else sol.sensor_across_mm):.4f} mm**, along: **{(sol.sensor_across_mm if sol.tilt_axis == "along" else sol.sensor_along_mm):.4f} mm** |
 | Focal length | — | **{cam['focal_mm']} mm** |
 | Pixel size | `sensor_across / image_across_px` | **{sol.pixel_size_mm*1000:.3f} µm** |
 | Tilt | — | **{sol.tilt_from_nadir_deg:.2f}° from nadir** / **{tilt_h:.2f}° from horizontal** |
 | Tilt axis | — | **{sol.tilt_axis}** |
-| Half FOV across | `atan(sensor_across / (2×fl))` | {sol.half_fov_across_deg:.4f}° → full {sol.full_fov_across_deg:.4f}° |
-| Half FOV along | `atan(sensor_along / (2×fl))` | {sol.half_fov_along_deg:.4f}° → full {sol.full_fov_along_deg:.4f}° |
+| Half FOV across | `atan(sensor_across / (2×fl))` | {(sol.half_fov_along_deg if sol.tilt_axis == "along" else sol.half_fov_across_deg):.4f}° → full {(sol.full_fov_along_deg if sol.tilt_axis == "along" else sol.full_fov_across_deg):.4f}° |
+| Half FOV along | `atan(sensor_along / (2×fl))` | {(sol.half_fov_across_deg if sol.tilt_axis == "along" else sol.half_fov_along_deg):.4f}° → full {(sol.full_fov_across_deg if sol.tilt_axis == "along" else sol.full_fov_along_deg):.4f}° |
 | Diag PP→edge | `sqrt((active tilt-plane sensor / 2)² + fl²)` | **{sol.diag_image_mm:.4f} mm** |
 | Inner edge | `H × tan(θ − φ_w)` | **{m_to_unit(abs(inner_gx), dist_unit):.2f} {dist_unit}** from nadir |
 | Outer edge | `H × tan(θ + φ_w)` | **{m_to_unit(abs(outer_gx), dist_unit):.2f} {dist_unit}** from nadir |
