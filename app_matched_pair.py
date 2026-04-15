@@ -336,18 +336,18 @@ def get_body(name):
 
 
 def geometry_orientation_for_camera(cam):
-    """Map UI orientation to the geometry convention.
+    """Pass the selected orientation straight through to the geometry model.
 
-    In the planner UI, fore/aft cameras may be described by the client-facing
-    window view convention (rotated relative to side cameras). Internally the
-    geometry expects orientation relative to the ground axes, so along-axis
-    cameras use the opposite orientation label to represent the same physical
-    sensor rotated 90 degrees on the mounting plate.
+    Orientation in the planner is referenced to the line of flight / ground
+    axes, so:
+    - portrait  = short sensor axis across-track
+    - landscape = long sensor axis across-track
+
+    Do not remap fore/aft cameras here. If the user sets all four obliques to
+    portrait, the geometry should treat them as the same physical camera
+    geometry with only the tilt axis changing.
     """
-    orientation = str(cam.get("orientation", "portrait"))
-    if str(cam.get("tilt_axis", "across")) == "along":
-        return "portrait" if orientation == "landscape" else "landscape"
-    return orientation
+    return str(cam.get("orientation", "portrait"))
 
 def get_inner_outer_angles(sol):
     return sol.near_angle_deg, sol.far_angle_deg
