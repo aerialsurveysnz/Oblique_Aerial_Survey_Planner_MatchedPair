@@ -348,6 +348,30 @@ def geometry_orientation_for_camera(cam):
     """
     return str(cam.get("orientation", "portrait"))
 
+
+def apply_active_tilt_plane_gsd(sol, focal_length_mm: float):
+    """Recompute diagonal image distance and GSD using the active tilt plane.
+
+    The geometry module already returns the correct footprint and slant values for
+    both across- and along-tilt cameras. The remaining mismatch for rotated rigs
+    comes from using sensor_across_mm in the slant-plane diagonal term for every
+    camera. For fore/aft cameras, the active tilt plane is the along-track sensor
+    dimension, so use sensor_along_mm there.
+    """
+    sensor_tilt_plane_mm = sol.sensor_across_mm if sol.tilt_axis == "across" else sol.sensor_along_mm
+    diag_image_mm = math.sqrt((sensor_tilt_plane_mm / 2.0) ** 2 + float(focal_length_mm) ** 2)
+
+    def _gsd_from_slant(slant_m: float) -> float:
+        return (sol.pixel_size_mm * float(slant_m) * 1000.0 / diag_image_mm) / 1000.0
+
+    return replace(
+        sol,
+        diag_image_mm=diag_image_mm,
+        near_gsd_m=_gsd_from_slant(sol.near_slant_m),
+        centre_gsd_m=_gsd_from_slant(sol.centre_slant_m),
+        far_gsd_m=_gsd_from_slant(sol.far_slant_m),
+    )
+
 def get_inner_outer_angles(sol):
     return sol.near_angle_deg, sol.far_angle_deg
 
@@ -1260,6 +1284,7 @@ def build_solutions_for_optimizer(camera_configs, altitude_m):
                 label=cam["label"],
             )
             sol = mirror_solution_for_label(sol)
+            sol = apply_active_tilt_plane_gsd(sol, cam["focal_mm"])
             sol = replace(sol, orientation=cam["orientation"])
             solutions_local.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
         except Exception as exc:
@@ -2282,6 +2307,7 @@ for i, cam in enumerate(active):
             label               = cam["label"],
         )
         sol = mirror_solution_for_label(sol)
+        sol = apply_active_tilt_plane_gsd(sol, cam["focal_mm"])
         sol = replace(sol, orientation=cam["orientation"])
         solutions.append((cam, sol, CAM_COLOURS[i % len(CAM_COLOURS)]))
     except Exception as e:
@@ -3678,7 +3704,7 @@ with st.expander("Show intermediate calculations per camera", expanded=False):
 | Tilt axis | — | **{sol.tilt_axis}** |
 | Half FOV across | `atan(sensor_across / (2×fl))` | {sol.half_fov_across_deg:.4f}° → full {sol.full_fov_across_deg:.4f}° |
 | Half FOV along | `atan(sensor_along / (2×fl))` | {sol.half_fov_along_deg:.4f}° → full {sol.full_fov_along_deg:.4f}° |
-| Diag PP→edge | `sqrt((sensor_across/2)² + fl²)` | **{sol.diag_image_mm:.4f} mm** |
+| Diag PP→edge | `sqrt((active tilt-plane sensor / 2)² + fl²)` | **{sol.diag_image_mm:.4f} mm** |
 | Inner edge | `H × tan(θ − φ_w)` | **{m_to_unit(abs(inner_gx), dist_unit):.2f} {dist_unit}** from nadir |
 | Outer edge | `H × tan(θ + φ_w)` | **{m_to_unit(abs(outer_gx), dist_unit):.2f} {dist_unit}** from nadir |
 | Inner slant | `sqrt(H² + Gx²)` | **{min(sol.near_slant_m, sol.far_slant_m):.2f} m** |
@@ -3737,7 +3763,7 @@ Defined as `outer GSD / inner GSD`. Values:
 ### GSD formula (slant-plane, matching spreadsheet)
 ```
 GSD = pixel_size_mm × slant_2d_mm / diag_image_mm
-diag_image_mm = sqrt((sensor_across/2)² + focal_length²)
+diag_image_mm = sqrt((active tilt-plane sensor / 2)² + focal_length²)
 ```
 
 ### Photo spacing
