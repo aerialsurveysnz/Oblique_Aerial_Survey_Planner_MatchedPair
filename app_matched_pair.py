@@ -336,15 +336,15 @@ def get_body(name):
 
 
 def geometry_orientation_for_camera(cam):
-    """Pass the selected orientation straight through to the geometry model.
+    """Return the selected orientation unchanged.
 
-    Orientation in the planner is referenced to the flight line / ground axes:
+    Option A uses the physical rig orientation referenced to the flight line:
     - portrait  = short sensor axis across-track, long axis along-track
     - landscape = long sensor axis across-track, short axis along-track
 
-    Do not remap fore/aft cameras here. A camera that is simply rotated on the
-    mounting plate should be represented by the same orientation choice if the
-    user wants the same ground geometry with only the tilt axis changing.
+    Do not remap fore/aft cameras here. The geometry solver should receive the
+    same orientation the user selected, while tilt_axis continues to define
+    whether the camera tilts across-track (L/R) or along-track (F/A).
     """
     return str(cam.get("orientation", "portrait"))
 
@@ -2159,20 +2159,21 @@ st.subheader("Camera Configuration")
 
 with st.expander("Orientation & tilt-axis reference", expanded=False):
     st.markdown("""
-| Setting | Option | Meaning in this app | Practical note |
+| Setting | Option | Flight-line reference | Meaning |
 |---|---|---|---|
-| **Orientation** | Portrait | **Short sensor axis across-track**, **long axis along-track** | Defined relative to the **flight line**, not the aircraft window view |
-| | Landscape | **Long sensor axis across-track**, **short axis along-track** | Also defined relative to the **flight line** |
-| **Tilt axis** | Across (L/R) | Tilts left/right about the along-track axis | Left & Right oblique |
-| | Along (F/A) | Tilts fore/aft about the across-track axis | Fore & Aft oblique |
+| **Orientation** | Portrait | Short sensor axis across-track | Long sensor axis runs along the flight line |
+| | Landscape | Long sensor axis across-track | Short sensor axis runs along the flight line |
+| **Tilt axis** | Across (L/R) | Tilts left/right about the along-track axis | Use for left and right oblique cameras |
+| | Along (F/A) | Tilts fore/aft about the across-track axis | Use for fore and aft oblique cameras |
 
-**Important:** Portrait / Landscape here are referenced to the **line of flight / ground axes**.
-They are **not** aircraft-window descriptions. A side-looking camera may therefore appear
-"landscape" when viewed in the aircraft, even though it is **Portrait** in this app.
+**Important:** Orientation here is referenced to the **flight line / ground axes**, not to the
+view out of the aircraft opening. If your rig is mounted so the long side of the sensor runs
+across the line of flight, choose **Landscape**. If the short side runs across the line of
+flight, choose **Portrait**.
 
 **Spreadsheet match:** The Landscape sheet in the reference spreadsheet uses portrait-mounted
-L/R cameras (narrow axis across-track). The default settings here reproduce those values exactly.
-For the Left camera, enter the same tilt angle as Right — the mirroring is handled automatically.
+L/R cameras (short axis across-track). For the Left camera, enter the same tilt angle as Right —
+the mirroring is handled automatically.
     """)
 
 cameras      = st.session_state.cameras
