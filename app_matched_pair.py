@@ -6,6 +6,25 @@ Three diagram views: footprint plan (all frames), cross-section, multi-strip.
 
 Geometry verified against Oblique_setup9_working_2.xls — all values match.
 
+FIXES (fore/aft GSD & FOV):
+─────────────────────────────────────────────────────────────────────────────
+FIX A — geometry_orientation_for_camera():
+  Fore/aft (along-tilt) cameras are physically rotated 90° relative to the
+  flight line, so their portrait/landscape orientation is swapped before being
+  passed to the geometry solver.  This ensures the short sensor axis is placed
+  in the tilt plane for portrait fore/aft cameras, giving identical slant
+  distances and GSD to the equivalent portrait left/right cameras.
+
+FIX B — apply_active_tilt_plane_gsd():
+  Uses sensor_along_mm (the tilt-plane dimension after the orientation swap)
+  for the slant-plane diagonal of fore/aft cameras, so all four cameras share
+  the same diag_image_mm and produce matching GSD values.
+
+FIX C — Per-Camera Results table & intermediate calc expander:
+  FOV across/along columns are swapped for along-tilt cameras so they always
+  display the physically-correct across-track and along-track FOV values.
+─────────────────────────────────────────────────────────────────────────────
+
 Spreadsheet convention notes
 ─────────────────────────────
 The Landscape sheet uses portrait-mounted L/R cameras (narrow axis across-track).
@@ -2347,6 +2366,27 @@ for i, cam in enumerate(active):
 for e in errors:
     st.error(e)
 
+# Warn when a camera label suggests fore/aft but tilt-axis is Across (L/R), or vice versa.
+# These combinations produce footprints projecting in the wrong direction.
+_FA_TOKENS = ["fore", "forward", "front", "aft", "rear", "back"]
+_LR_TOKENS = ["left", "right"]
+for _cam, _sol, _ in solutions:
+    _lbl = (_sol.label or "").lower()
+    _is_fa = any(t in _lbl for t in _FA_TOKENS)
+    _is_lr = any(t in _lbl for t in _LR_TOKENS)
+    if _is_fa and _sol.tilt_axis == "across":
+        st.warning(
+            f"⚠️ **{_sol.label}**: label suggests a fore/aft camera but **Tilt axis** is "
+            f"*Across (L/R)*. The footprint will project sideways instead of fore/aft. "
+            f"Set **Tilt axis** to *Along (F/A)* for the correct footprint direction."
+        )
+    if _is_lr and _sol.tilt_axis == "along":
+        st.warning(
+            f"⚠️ **{_sol.label}**: label suggests a left/right camera but **Tilt axis** is "
+            f"*Along (F/A)*. The footprint will project fore/aft instead of sideways. "
+            f"Set **Tilt axis** to *Across (L/R)* for the correct footprint direction."
+        )
+
 if not solutions:
     st.warning("No cameras enabled. Enable at least one camera in the table above.")
     st.stop()
@@ -2394,6 +2434,49 @@ if mc:
               f"{mc.forward_overlap_near*100:.0f}% / "
               f"{mc.forward_overlap_centre*100:.0f}% / "
               f"{mc.forward_overlap_far*100:.0f}%")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-camera results table  (immediately below System Summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.subheader("Per-Camera Results")
+
+_rows = []
+for _cam, _sol, _ in solutions:
+    _inner_gx, _outer_gx = corner_inner_outer(_sol)
+    _inner_len, _outer_len = along_lengths_for_display(_sol)
+    _inner_gsd = min(_sol.near_gsd_m, _sol.far_gsd_m)
+    _outer_gsd = max(_sol.near_gsd_m, _sol.far_gsd_m)
+    _tilt_h = 90.0 - _sol.tilt_from_nadir_deg
+    _rows.append({
+        "Camera":                      _sol.label,
+        "Body / FL":                   f"{_cam['body']}  {_cam['focal_mm']:.0f} mm",
+        "Orient.":                     _sol.orientation,
+        "Tilt axis":                   _sol.tilt_axis,
+        "Tilt nadir °":           round(_sol.tilt_from_nadir_deg, 1),
+        "Tilt horiz °":           round(_tilt_h, 1),
+        "Near oblique angle":          format_oblique(_sol.near_angle_deg),
+        "Far oblique angle":           format_oblique(_sol.far_angle_deg),
+        "Pixel µm":              round(_sol.pixel_size_mm * 1000, 2),
+        "FOV across °":          round(_sol.full_fov_along_deg   if _sol.tilt_axis == "along" else _sol.full_fov_across_deg, 2),
+        "FOV along °":           round(_sol.full_fov_across_deg  if _sol.tilt_axis == "along" else _sol.full_fov_along_deg,  2),
+        f"Inner edge ({dist_unit})":   round(m_to_unit(abs(_inner_gx), dist_unit), 1),
+        f"Outer edge ({dist_unit})":   round(m_to_unit(abs(_outer_gx), dist_unit), 1),
+        f"Inner length ({dist_unit})": round(m_to_unit(_inner_len, dist_unit), 1),
+        f"Outer length ({dist_unit})": round(m_to_unit(_outer_len, dist_unit), 1),
+        "Inner GSD cm":                round(_inner_gsd * 100, 3),
+        "Centre GSD cm":               round(_sol.centre_gsd_m * 100, 3),
+        "Outer GSD cm":                round(_outer_gsd * 100, 3),
+        "Inner slant m":               round(min(_sol.near_slant_m, _sol.far_slant_m), 1),
+        "Outer slant m":               round(max(_sol.near_slant_m, _sol.far_slant_m), 1),
+        "Diag image mm":               round(_sol.diag_image_mm, 4),
+    })
+st.dataframe(_rows, width="stretch")
+st.caption(
+    "**Near/Far oblique angle** = angle from vertical (nadir) at the inner and outer image edges. "
+    "Higher angles mean a stronger oblique view."
+)
 
 mission_outputs = None
 aoi_fig = None
@@ -2573,59 +2656,6 @@ else:
                 st.pyplot(aoi_fig)
     else:
         st.info("Select the standard example or load a KML from the library to see lines, frames, images and storage estimates.")
-
-st.markdown("---")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-camera results table  (includes obliqueness ratio)
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.subheader("Per-Camera Results")
-
-rows = []
-for cam, sol, _ in solutions:
-    inner_gx, outer_gx = corner_inner_outer(sol)
-    inner_len, outer_len = along_lengths_for_display(sol)
-    inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
-    outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
-    tilt_h = 90.0 - sol.tilt_from_nadir_deg
-
-    rows.append({
-    "Camera":                    sol.label,
-    "Body / FL":                 f"{cam['body']}  {cam['focal_mm']:.0f} mm",
-    "Orient.":                   sol.orientation,
-    "Tilt axis":                 sol.tilt_axis,
-    "Tilt nadir °":              round(sol.tilt_from_nadir_deg, 1),
-    "Tilt horiz °":              round(tilt_h, 1),
-
-    # ── Oblique angles ──
-    "Near oblique angle":        format_oblique(sol.near_angle_deg),
-    "Far oblique angle":         format_oblique(sol.far_angle_deg),
-    # ─────────────────────
-
-    "Pixel µm":                  round(sol.pixel_size_mm * 1000, 2),
-    # For along-tilt (fore/aft) cameras the solver receives a swapped orientation
-    # so its fov_across/fov_along fields are physically transposed — swap back for display.
-    "FOV across °":              round(sol.full_fov_along_deg   if sol.tilt_axis == "along" else sol.full_fov_across_deg, 2),
-    "FOV along °":               round(sol.full_fov_across_deg  if sol.tilt_axis == "along" else sol.full_fov_along_deg,  2),
-    f"Inner edge ({dist_unit})": round(m_to_unit(abs(inner_gx), dist_unit), 1),
-    f"Outer edge ({dist_unit})": round(m_to_unit(abs(outer_gx), dist_unit), 1),
-    f"Inner length ({dist_unit})": round(m_to_unit(inner_len, dist_unit), 1),
-    f"Outer length ({dist_unit})": round(m_to_unit(outer_len, dist_unit), 1),
-    "Inner GSD cm":              round(inner_gsd * 100, 3),
-    "Centre GSD cm":             round(sol.centre_gsd_m * 100, 3),
-    "Outer GSD cm":              round(outer_gsd * 100, 3),
-    "Inner slant m":             round(min(sol.near_slant_m, sol.far_slant_m), 1),
-    "Outer slant m":             round(max(sol.near_slant_m, sol.far_slant_m), 1),
-    "Diag image mm":             round(sol.diag_image_mm, 4),
-})
-
-st.dataframe(rows, width="stretch")
-st.caption(
-    "**Near/Far oblique angle** = angle from vertical (nadir) at the inner and outer image edges. "
-    "Higher angles mean a stronger oblique view."
-)
-st.markdown("---")
 
 settings_rows, system_rows, camera_rows = build_export_data(
     solutions=solutions,
