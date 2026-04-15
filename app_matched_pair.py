@@ -336,17 +336,48 @@ def get_body(name):
 
 
 def geometry_orientation_for_camera(cam):
-    """Return the selected orientation unchanged.
+    """Map the user-selected physical orientation to the geometry-solver orientation.
 
-    Option A uses the physical rig orientation referenced to the flight line:
-    - portrait  = short sensor axis across-track, long axis along-track
-    - landscape = long sensor axis across-track, short axis along-track
+    The user selects orientation relative to the LINE OF FLIGHT:
+        portrait  = camera held so the SHORT side faces across-track
+                    (long side along the flight line)
+        landscape = camera held so the LONG side faces across-track
+                    (short side along the flight line)
 
-    Do not remap fore/aft cameras here. The geometry solver should receive the
-    same orientation the user selected, while tilt_axis continues to define
-    whether the camera tilts across-track (L/R) or along-track (F/A).
+    The geometry solver uses orientation relative to the TILT AXIS:
+        portrait  → narrow (short) sensor axis is sensor_across_mm
+        landscape → wide (long)   sensor axis is sensor_across_mm
+
+    For LEFT/RIGHT cameras (tilt_axis='across') the across-track direction
+    matches the physical across-track direction, so the mapping is 1-to-1:
+        user portrait  → solver portrait  (short axis across-track)
+        user landscape → solver landscape (long axis across-track)
+
+    For FORE/AFT cameras (tilt_axis='along') the camera body is physically
+    rotated 90° relative to the flight line so its tilt plane faces fore/aft.
+    This rotation swaps which sensor dimension faces across-track vs along-track:
+        user portrait  (short side across-track physically)
+                       → the LONG sensor dimension now faces across-track
+                          from the solver's perspective
+                       → solver orientation = 'landscape'
+        user landscape (long side across-track physically)
+                       → the SHORT sensor dimension now faces across-track
+                          from the solver's perspective
+                       → solver orientation = 'portrait'
+
+    In summary: for along-tilt (fore/aft) cameras the orientation is flipped
+    before being passed to the geometry solver so that sensor_across_mm always
+    contains the dimension that physically faces across the line of flight.
     """
-    return str(cam.get("orientation", "portrait"))
+    user_orient = str(cam.get("orientation", "portrait"))
+    tilt_axis   = str(cam.get("tilt_axis",   "across"))
+
+    if tilt_axis == "along":
+        # Fore/aft cameras are rotated 90° — swap the orientation mapping
+        return "landscape" if user_orient == "portrait" else "portrait"
+
+    # Left/right (across-tilt) cameras: direct mapping
+    return user_orient
 
 
 def apply_active_tilt_plane_gsd(sol, focal_length_mm: float):
