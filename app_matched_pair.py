@@ -336,18 +336,18 @@ def get_body(name):
 
 
 def geometry_orientation_for_camera(cam):
-    """Map UI orientation to the geometry convention.
+    """Pass the selected orientation straight through to the geometry model.
 
-    In the planner UI, fore/aft cameras may be described by the client-facing
-    window view convention (rotated relative to side cameras). Internally the
-    geometry expects orientation relative to the ground axes, so along-axis
-    cameras use the opposite orientation label to represent the same physical
-    sensor rotated 90 degrees on the mounting plate.
+    Orientation in the planner is referenced to the line of flight / ground
+    axes, so:
+    - portrait  = short sensor axis across-track
+    - landscape = long sensor axis across-track
+
+    Do not remap fore/aft cameras here. If the user sets all four obliques to
+    portrait, the geometry should treat them as the same physical camera
+    geometry with only the tilt axis changing.
     """
-    orientation = str(cam.get("orientation", "portrait"))
-    if str(cam.get("tilt_axis", "across")) == "along":
-        return "portrait" if orientation == "landscape" else "landscape"
-    return orientation
+    return str(cam.get("orientation", "portrait"))
 
 def get_inner_outer_angles(sol):
     return sol.near_angle_deg, sol.far_angle_deg
@@ -1274,8 +1274,6 @@ def optimizer_penalty(candidate, requirements):
     penalty += max(0.0, float(requirements["min_image_hits"]) - float(candidate["hits_min"])) * 120.0
     if requirements.get("require_no_gaps", True) and candidate.get("has_gap", False):
         penalty += 1000.0 + float(candidate.get("zero_hit_pct", 0.0)) * 50.0
-    if requirements.get("min_inner_oblique_angle_deg") is not None:
-        penalty += max(0.0, float(requirements["min_inner_oblique_angle_deg"]) - float(candidate["min_oblique_angle_deg"])) * 20.0
     if requirements.get("max_inner_gsd_cm") is not None:
         penalty += max(0.0, float(candidate["inner_gsd_cm"]) - float(requirements["max_inner_gsd_cm"])) * 15.0
     if requirements.get("max_outer_gsd_cm") is not None:
@@ -1423,8 +1421,6 @@ def evaluate_optimizer_candidate(
         failure_reasons.append(f"min viewing angles {result['angles_min']} < {int(requirements['min_viewing_angles'])}")
     if result["hits_min"] < int(requirements["min_image_hits"]):
         failure_reasons.append(f"min image hits {result['hits_min']} < {int(requirements['min_image_hits'])}")
-    if requirements.get("min_inner_oblique_angle_deg") is not None and result["min_oblique_angle_deg"] < float(requirements["min_inner_oblique_angle_deg"]):
-        failure_reasons.append(f"inner-edge oblique angle {result['min_oblique_angle_deg']:.1f}° < {float(requirements['min_inner_oblique_angle_deg']):.1f}°")
     if requirements.get("require_no_gaps", True) and result["has_gap"]:
         failure_reasons.append(f"coverage gap {format_gap_pct(result['zero_hit_pct'])}")
     if requirements.get("max_inner_gsd_cm") is not None and result["inner_gsd_cm"] > float(requirements["max_inner_gsd_cm"]):
@@ -3363,22 +3359,6 @@ with req_col1:
         step=1,
         key="opt_min_image_hits",
     )
-    opt_enforce_inner_oblique_angle = st.checkbox(
-        "Set a minimum inner-edge oblique angle",
-        value=False,
-        key="opt_enforce_inner_oblique_angle",
-    )
-    opt_min_inner_oblique_angle_deg = None
-    if opt_enforce_inner_oblique_angle:
-        opt_min_inner_oblique_angle_deg = st.number_input(
-            "Minimum inner-edge oblique angle (deg)",
-            min_value=0.0,
-            max_value=89.0,
-            value=round(float(current_oblique_tilt), 1),
-            step=0.5,
-            key="opt_min_inner_oblique_angle_deg",
-            help="Minimum angle from nadir required at the inner image edge for the controlling oblique cameras.",
-        )
     opt_require_no_gaps = st.checkbox(
         "Require full repeat-cell coverage (no gaps)",
         value=True,
@@ -3529,7 +3509,6 @@ st.caption(
 requirements = {
     "min_viewing_angles": int(opt_min_viewing_angles),
     "min_image_hits": int(opt_min_image_hits),
-    "min_inner_oblique_angle_deg": float(opt_min_inner_oblique_angle_deg) if opt_enforce_inner_oblique_angle and opt_min_inner_oblique_angle_deg is not None else None,
     "require_no_gaps": bool(opt_require_no_gaps),
     "max_inner_gsd_cm": float(opt_max_inner_gsd_cm) if opt_enforce_inner_gsd and opt_max_inner_gsd_cm is not None else None,
     "max_outer_gsd_cm": float(opt_max_outer_gsd_cm) if opt_enforce_outer_gsd and opt_max_outer_gsd_cm is not None else None,
