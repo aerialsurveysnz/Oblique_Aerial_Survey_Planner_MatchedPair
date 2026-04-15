@@ -1322,6 +1322,8 @@ def optimizer_penalty(candidate, requirements):
         penalty += max(0.0, float(candidate["outer_gsd_cm"]) - float(requirements["max_outer_gsd_cm"])) * 25.0
     if requirements.get("min_achieved_sidelap_pct") is not None:
         penalty += max(0.0, float(requirements["min_achieved_sidelap_pct"]) - float(candidate["achieved_sidelap_pct"])) * 6.0
+    if requirements.get("min_inner_oblique_angle_deg") is not None:
+        penalty += max(0.0, float(requirements["min_inner_oblique_angle_deg"]) - float(candidate.get("min_oblique_angle_deg", 0.0))) * 30.0
     return penalty
 
 
@@ -1471,6 +1473,8 @@ def evaluate_optimizer_candidate(
         failure_reasons.append(f"outer GSD {result['outer_gsd_cm']:.2f} cm > {float(requirements['max_outer_gsd_cm']):.2f} cm")
     if requirements.get("min_achieved_sidelap_pct") is not None and np.isfinite(result["achieved_sidelap_pct"]) and result["achieved_sidelap_pct"] < float(requirements["min_achieved_sidelap_pct"]):
         failure_reasons.append(f"achieved sidelap {result['achieved_sidelap_pct']:.1f}% < {float(requirements['min_achieved_sidelap_pct']):.1f}%")
+    if requirements.get("min_inner_oblique_angle_deg") is not None and result.get("min_oblique_angle_deg", 0.0) < float(requirements["min_inner_oblique_angle_deg"]):
+        failure_reasons.append(f"inner oblique angle {result.get('min_oblique_angle_deg', 0.0):.1f}° < {float(requirements['min_inner_oblique_angle_deg']):.1f}°")
 
     result["valid"] = len(failure_reasons) == 0
     result["reason"] = "Pass" if result["valid"] else "; ".join(failure_reasons)
@@ -3429,6 +3433,33 @@ with req_col1:
             step=0.1,
             key="opt_max_outer_gsd_cm",
         )
+    opt_enforce_min_inner_angle = st.checkbox(
+        "Set a minimum inner-edge oblique angle",
+        value=False,
+        key="opt_enforce_min_inner_angle",
+        help="Ensures the camera is looking at a meaningful oblique angle at the near (nadir-side) image edge. "
+             "Useful when the client brief requires a minimum oblique perspective across the whole image.",
+    )
+    opt_min_inner_oblique_angle_deg = None
+    if opt_enforce_min_inner_angle:
+        # Default to current rig's inner oblique angle if available
+        _current_inner_angle = 0.0
+        if solutions:
+            _oblique_sols = [sol for _, sol, _ in solutions if abs(sol.tilt_from_nadir_deg) > 1.0]
+            if _oblique_sols:
+                _current_inner_angle = min(
+                    min(sol.near_angle_deg, sol.far_angle_deg) for sol in _oblique_sols
+                )
+        opt_min_inner_oblique_angle_deg = st.number_input(
+            "Minimum inner-edge oblique angle (°)",
+            min_value=0.0,
+            max_value=80.0,
+            value=round(max(0.0, _current_inner_angle), 1),
+            step=0.5,
+            key="opt_min_inner_oblique_angle_deg",
+            help="Angle from nadir (vertical) at the inner image edge. 0° = straight down, 90° = horizontal. "
+                 "A value of e.g. 20° means the nearest image edge must be looking at least 20° off vertical.",
+        )
 
 with req_col2:
     opt_min_achieved_sidelap = st.number_input(
@@ -3548,6 +3579,7 @@ requirements = {
     "max_inner_gsd_cm": float(opt_max_inner_gsd_cm) if opt_enforce_inner_gsd and opt_max_inner_gsd_cm is not None else None,
     "max_outer_gsd_cm": float(opt_max_outer_gsd_cm) if opt_enforce_outer_gsd and opt_max_outer_gsd_cm is not None else None,
     "min_achieved_sidelap_pct": float(opt_min_achieved_sidelap),
+    "min_inner_oblique_angle_deg": float(opt_min_inner_oblique_angle_deg) if opt_enforce_min_inner_angle and opt_min_inner_oblique_angle_deg is not None else None,
 }
 
 run_optimiser = st.button("Run optimiser", key="run_optimiser")
