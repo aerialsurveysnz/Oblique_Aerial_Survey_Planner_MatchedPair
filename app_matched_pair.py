@@ -158,9 +158,13 @@ DEFAULT_CAMERAS = [
     },
 ]
 
-PRESET_FILE = Path("presets.json")
-SCENARIO_DIR = Path("saved_scenarios")
-AOI_LIBRARY_DIR = Path("aoi_library")
+# Anchor all data paths to the directory containing this app file so that
+# scenarios, presets and AOI files are always found regardless of which
+# working directory Streamlit is launched from.
+_APP_DIR = Path(__file__).resolve().parent
+PRESET_FILE     = _APP_DIR / "presets.json"
+SCENARIO_DIR    = _APP_DIR / "saved_scenarios"
+AOI_LIBRARY_DIR = _APP_DIR / "aoi_library"
 DEFAULT_ALTITUDE_M = 600.0
 DEFAULT_SPEED_MS = 62.0
 DEFAULT_SPEED_KTS = DEFAULT_SPEED_MS * 1.94384
@@ -338,7 +342,7 @@ def list_saved_scenarios():
     for path in sorted(SCENARIO_DIR.glob("*.json"), key=lambda p: p.name.lower()):
         _append(path, "saved_scenarios")
 
-    for path in sorted(Path(".").glob("*.json"), key=lambda p: p.name.lower()):
+    for path in sorted(_APP_DIR.glob("*.json"), key=lambda p: p.name.lower()):
         if path.name == PRESET_FILE.name:
             continue
         _append(path, "project_root")
