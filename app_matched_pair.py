@@ -1637,20 +1637,49 @@ def kml_ring_to_lonlat(coords_text):
 
 
 def lonlat_to_local_xy(points):
+    """Convert WGS84 lon/lat points to NZTM (EPSG:2193) easting/northing.
+
+    NZTM is the standard NZ coordinate system — it gives accurate distances
+    and areas across New Zealand without the distortion of a flat-earth
+    approximation.  The returned coordinates are NZTM metres (easting, northing).
+
+    Returns:
+        (nztm_points, lon0, lat0) where lon0/lat0 is the centroid in WGS84
+        (retained for backward compatibility with the basemap tile fetcher).
+    """
     if not points:
         return [], 0.0, 0.0
     lons = [p[0] for p in points]
     lats = [p[1] for p in points]
     lon0 = float(sum(lons) / len(lons))
     lat0 = float(sum(lats) / len(lats))
-    r = 6378137.0
-    cos_lat = math.cos(math.radians(lat0))
-    local = []
-    for lon, lat in points:
-        x = r * math.radians(lon - lon0) * cos_lat
-        y = r * math.radians(lat - lat0)
-        local.append((x, y))
-    return local, lon0, lat0
+    try:
+        import pyproj
+        _wgs84_to_nztm = pyproj.Transformer.from_crs(
+            "EPSG:4326", "EPSG:2193", always_xy=True
+        )
+        nztm_pts = []
+        for lon, lat in points:
+            e, n = _wgs84_to_nztm.transform(lon, lat)
+            nztm_pts.append((e, n))
+        # Centre the polygon on its NZTM centroid so axes show
+        # offsets from the AOI centre in kilometres (easier to read).
+        e_vals = [p[0] for p in nztm_pts]
+        n_vals = [p[1] for p in nztm_pts]
+        e0 = sum(e_vals) / len(e_vals)
+        n0 = sum(n_vals) / len(n_vals)
+        local = [(e - e0, n - n0) for e, n in nztm_pts]
+        return local, lon0, lat0
+    except ImportError:
+        # pyproj not available — fall back to flat-earth approximation
+        r = 6378137.0
+        cos_lat = math.cos(math.radians(lat0))
+        local = []
+        for lon, lat in points:
+            x = r * math.radians(lon - lon0) * cos_lat
+            y = r * math.radians(lat - lat0)
+            local.append((x, y))
+        return local, lon0, lat0
 
 
 def parse_kml_aoi(path):
@@ -2019,28 +2048,45 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 import contextily as ctx
                 import pyproj
 
-                # Project the actual AOI lon/lat bounds to Web Mercator.
-                # Using the real geographic bounds (not back-converted from local
-                # metres) gives the correct tile fetch extent and image alignment.
-                transformer = pyproj.Transformer.from_crs(
+                # ── Coordinate alignment strategy ──────────────────────────────
+                # The AOI polygon is drawn in local metres with origin at
+                # (lon0, lat0) — the centroid of the first KML ring.
+                # The tile image must be positioned so that (lon0, lat0) maps
+                # to local (0, 0), and the tile's geographic extent maps to the
+                # correct local metre offsets.
+                #
+                # Steps:
+                #  1. Convert display axes limits (local metres) to lon/lat
+                #  2. Project those to Web Mercator for tile fetching
+                #  3. After fetching, set the image extent using the SAME
+                #     local-metre values so the tile aligns with the polygon.
+
+                # Convert display axes limits (local NZTM-centred metres)
+                # → WGS84 → Web Mercator for tile fetching.
+                nztm_to_wgs84 = pyproj.Transformer.from_crs(
+                    "EPSG:2193", "EPSG:4326", always_xy=True
+                )
+                wgs84_to_merc = pyproj.Transformer.from_crs(
                     "EPSG:4326", "EPSG:3857", always_xy=True
                 )
-
-                # Add the same proportional padding used for the display axes
-                # so the tile extent matches what is visible in the plot.
-                lon_span = lon_max - lon_min
-                lat_span = lat_max - lat_min
-                pad_frac = 0.22
-                lon_pad  = lon_span * pad_frac
-                lat_pad  = lat_span * pad_frac
-                merc_w, merc_s = transformer.transform(
-                    lon_min - lon_pad, lat_min - lat_pad
+                # Reconstruct absolute NZTM coords from display limits.
+                # We need the NZTM centroid (e0, n0) of the AOI for this.
+                # Re-project lon0/lat0 (WGS84 centroid) to NZTM to get e0/n0.
+                wgs84_to_nztm = pyproj.Transformer.from_crs(
+                    "EPSG:4326", "EPSG:2193", always_xy=True
                 )
-                merc_e, merc_n = transformer.transform(
-                    lon_max + lon_pad, lat_max + lat_pad
-                )
+                e0, n0 = wgs84_to_nztm.transform(lon0, lat0)
 
-                # Set axes to Web Mercator so contextily fetches the right tiles
+                def _local_to_merc(lx_m, ly_m):
+                    """Local NZTM-centred metres → Web Mercator."""
+                    lon, lat = nztm_to_wgs84.transform(e0 + lx_m, n0 + ly_m)
+                    return wgs84_to_merc.transform(lon, lat)
+
+                # Display axes corners → Web Mercator
+                merc_w, merc_s = _local_to_merc(x_lo, y_lo)
+                merc_e, merc_n = _local_to_merc(x_hi, y_hi)
+
+                # Set axes to Web Mercator for tile fetching
                 ax.set_xlim(merc_w, merc_e)
                 ax.set_ylim(merc_s, merc_n)
 
@@ -2059,16 +2105,20 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     attribution_size=5,
                 )
 
-                # Restore local display coordinate limits
+                # Restore local display coordinate limits (in display units)
                 ax.set_xlim(x_lo / scale, x_hi / scale)
                 ax.set_ylim(y_lo / scale, y_hi / scale)
 
-                # Rescale the tile image to fill the local display extent exactly
+                # Set tile image extent to match local display coords exactly.
+                # This is the key alignment step — the image corners correspond
+                # to the Web Mercator corners we computed from local metres, so
+                # setting the extent to those same local-metre values (in display
+                # units) keeps the tile perfectly registered with the polygon.
                 for img in ax.get_images():
                     img.set_extent([x_lo / scale, x_hi / scale,
                                     y_lo / scale, y_hi / scale])
 
-                # Minimise attribution text size
+                # Minimise attribution text
                 for txt in ax.texts:
                     txt.set_fontsize(5)
                     txt.set_alpha(0.6)
@@ -2087,8 +2137,8 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     yt = ax.get_yticks()
     ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt],
                         color="#8b949e", fontsize=8)
-    ax.set_xlabel(f"Local easting ({axis_unit})", color="#8b949e", fontsize=9)
-    ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_xlabel(f"NZTM Easting offset ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_ylabel(f"NZTM Northing offset ({axis_unit})", color="#8b949e", fontsize=9)
     _aoi_name = mission_outputs.get("name", "AOI")
     ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
     ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
