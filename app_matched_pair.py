@@ -591,7 +591,7 @@ def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None
     return bio.getvalue()
 
 
-def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None, report_figures=None):
+def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None, report_figures=None, coverage_summary_data=None, fig_ms_6trigger_bytes=None):
     doc = Document()
 
     section = doc.sections[0]
@@ -647,7 +647,7 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
         if mission_figure_bytes:
             title_p = doc.add_paragraph("Sample area and generated flight lines")
             title_p.paragraph_format.keep_with_next = True
-            doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(5.8))
+            doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(9.0))
 
     doc.add_heading("Camera results", level=2)
     table2 = doc.add_table(rows=1, cols=13)
@@ -677,12 +677,42 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
         for i, value in enumerate(row_data):
             row[i].text = str(value)
 
+    # ── Point coverage summary table ─────────────────────────────────────────
+    if coverage_summary_data:
+        doc.add_heading("Point coverage summary", level=2)
+        cov_table = doc.add_table(rows=1, cols=3)
+        set_table_style(cov_table, "Light Grid Accent 1")
+        hdr_cov = cov_table.rows[0].cells
+        hdr_cov[0].text = "Metric"
+        hdr_cov[1].text = "Image hits"
+        hdr_cov[2].text = "Viewing angles"
+        for label, hits_val, angles_val in [
+            ("Minimum",  str(coverage_summary_data.get("hits_min", "—")),   str(coverage_summary_data.get("angles_min", "—"))),
+            ("Average",  f"{coverage_summary_data.get('hits_avg', 0):.1f}", f"{coverage_summary_data.get('angles_avg', 0):.1f}"),
+            ("Maximum",  str(coverage_summary_data.get("hits_max", "—")),   str(coverage_summary_data.get("angles_max", "—"))),
+        ]:
+            row_c = cov_table.add_row().cells
+            row_c[0].text = label
+            row_c[1].text = hits_val
+            row_c[2].text = angles_val
+
+    # ── 6-trigger multi-strip graphic ─────────────────────────────────────────
+    if fig_ms_6trigger_bytes:
+        doc.add_heading("Multi-strip coverage — 6 trigger instances", level=2)
+        p6 = doc.add_paragraph(
+            "Three adjacent strips showing 6 successive trigger instances per strip. "
+            "Illustrates forward overlap, sidelap, and the matched-frame cross-track coverage band."
+        )
+        p6.paragraph_format.keep_with_next = True
+        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=Inches(9.0))
+
+    # ── Coverage diagrams ─────────────────────────────────────────────────────
     if report_figures:
         doc.add_heading("Coverage diagrams", level=2)
         for figure_title, figure_bytes in report_figures:
             para = doc.add_paragraph(figure_title)
             para.paragraph_format.keep_with_next = True
-            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(6.7))
+            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(9.0))
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -2161,34 +2191,27 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 #  3. After fetching, set the image extent using the SAME
                 #     local-metre values so the tile aligns with the polygon.
 
-                # Convert display axes limits (local NZTM-centred metres)
-                # → WGS84 → Web Mercator for tile fetching.
-                nztm_to_wgs84 = pyproj.Transformer.from_crs(
-                    "EPSG:2193", "EPSG:4326", always_xy=True
-                )
-                wgs84_to_merc = pyproj.Transformer.from_crs(
-                    "EPSG:4326", "EPSG:3857", always_xy=True
-                )
-                # Reconstruct absolute NZTM coords from display limits.
-                # We need the NZTM centroid (e0, n0) of the AOI for this.
-                # Re-project lon0/lat0 (WGS84 centroid) to NZTM to get e0/n0.
-                wgs84_to_nztm = pyproj.Transformer.from_crs(
-                    "EPSG:4326", "EPSG:2193", always_xy=True
-                )
-                e0, n0 = wgs84_to_nztm.transform(lon0, lat0)
+                # ── Tile alignment strategy ────────────────────────────────
+                # The polygon is drawn in flat-earth local metres centred on
+                # (lon0, lat0):  x = R·Δlon·cos(lat0),  y = R·Δlat
+                # To align the tile perfectly, fetch it in WGS84 (EPSG:4326)
+                # with axes limits set to the WGS84 lon/lat that correspond to
+                # x_lo/x_hi/y_lo/y_hi, then rescale the image back to those
+                # same local metre values.  This avoids any NZTM↔WebMercator
+                # distortion entirely.
 
-                def _local_to_merc(lx_m, ly_m):
-                    """Local NZTM-centred metres → Web Mercator."""
-                    lon, lat = nztm_to_wgs84.transform(e0 + lx_m, n0 + ly_m)
-                    return wgs84_to_merc.transform(lon, lat)
+                _r      = 6378137.0
+                _coslat = math.cos(math.radians(lat0))
 
-                # Display axes corners → Web Mercator
-                merc_w, merc_s = _local_to_merc(x_lo, y_lo)
-                merc_e, merc_n = _local_to_merc(x_hi, y_hi)
+                # Local metres → WGS84 (exact inverse of flat-earth formula)
+                sw_lon = math.degrees(x_lo / (_r * _coslat)) + lon0
+                sw_lat = math.degrees(y_lo / _r) + lat0
+                ne_lon = math.degrees(x_hi / (_r * _coslat)) + lon0
+                ne_lat = math.degrees(y_hi / _r) + lat0
 
-                # Set axes to Web Mercator for tile fetching
-                ax.set_xlim(merc_w, merc_e)
-                ax.set_ylim(merc_s, merc_n)
+                # Temporarily set axes to WGS84 lon/lat for tile fetching
+                ax.set_xlim(sw_lon, ne_lon)
+                ax.set_ylim(sw_lat, ne_lat)
 
                 tile_source = (
                     ctx.providers.Esri.WorldImagery
@@ -2197,7 +2220,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 )
                 ctx.add_basemap(
                     ax,
-                    crs="EPSG:3857",
+                    crs="EPSG:4326",
                     source=tile_source,
                     alpha=0.65,
                     zorder=1,
@@ -2205,15 +2228,14 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     attribution_size=5,
                 )
 
-                # Restore local display coordinate limits (in display units)
+                # Restore local display coordinate limits
                 ax.set_xlim(x_lo / scale, x_hi / scale)
                 ax.set_ylim(y_lo / scale, y_hi / scale)
 
-                # Set tile image extent to match local display coords exactly.
-                # This is the key alignment step — the image corners correspond
-                # to the Web Mercator corners we computed from local metres, so
-                # setting the extent to those same local-metre values (in display
-                # units) keeps the tile perfectly registered with the polygon.
+                # The tile image spans sw_lon→ne_lon / sw_lat→ne_lat in WGS84,
+                # which by construction equals x_lo→x_hi / y_lo→y_hi in local
+                # metres — so setting the extent to the display limits aligns
+                # the tile perfectly with the polygon.
                 for img in ax.get_images():
                     img.set_extent([x_lo / scale, x_hi / scale,
                                     y_lo / scale, y_hi / scale])
@@ -3981,6 +4003,39 @@ with col_exp1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 with col_exp2:
+    # Generate a 6-trigger version of the multi-strip figure for the Word report
+    _fig_ms_6trigger_bytes = None
+    if mc and multistrip_solutions:
+        try:
+            _fig_ms6, _ax_ms6 = dark_fig(14, 8)
+            _ax_ms6.set_aspect("equal")
+            _line_sp6, _photo_sp6, _ = fallback_multistrip_spacing(
+                multistrip_solutions, fwd_frac=fwd_frac, side_frac=side_frac, mc=mc
+            )
+            _frame_offsets_6 = [_photo_sp6 * idx for idx in range(6)]
+            _strip_offsets_6 = [-_line_sp6, 0.0, _line_sp6]
+            for _strip_dx in _strip_offsets_6:
+                for _cam6, _sol6, _col6 in multistrip_solutions:
+                    _poly6 = camera_polygon(_sol6)
+                    for _fy in _frame_offsets_6:
+                        _shifted6 = [(_px + _strip_dx, _py + _fy) for _px, _py in _poly6]
+                        if all(math.isfinite(v) for xy in _shifted6 for v in xy):
+                            _xs6 = [p[0] for p in _shifted6] + [_shifted6[0][0]]
+                            _ys6 = [p[1] for p in _shifted6] + [_shifted6[0][1]]
+                            _ax_ms6.fill(_xs6, _ys6, color=_col6, alpha=0.10, zorder=2)
+                            _ax_ms6.plot(_xs6, _ys6, color=_col6, lw=0.6, alpha=0.7, zorder=3)
+            _ax_ms6.axhline(0, color="#8b949e", lw=0.8, ls="--", alpha=0.5)
+            _ax_ms6.set_xlabel(f"Across-track ({dist_unit})", color="#8b949e", fontsize=8)
+            _ax_ms6.set_ylabel(f"Along-track ({dist_unit})", color="#8b949e", fontsize=8)
+            _ax_ms6.set_title("Multi-strip — 6 trigger instances", color="#c9d1d9", fontsize=10)
+            _fig_ms6.tight_layout()
+            _fig_ms_6trigger_bytes = fig_to_png_bytes(_fig_ms6)
+            plt.close(_fig_ms6)
+        except Exception:
+            _fig_ms_6trigger_bytes = None
+
+    _coverage_export = coverage_summary(coverage_result) if coverage_result is not None else None
+
     word_bytes = make_word_export(
         settings_rows,
         system_rows,
@@ -3988,6 +4043,8 @@ with col_exp2:
         mission_rows=mission_rows,
         mission_figure_bytes=mission_figure_bytes,
         report_figures=report_figures,
+        coverage_summary_data=_coverage_export,
+        fig_ms_6trigger_bytes=_fig_ms_6trigger_bytes,
     )
     st.download_button(
         label="Download Word client report",
