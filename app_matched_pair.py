@@ -4111,8 +4111,9 @@ st.subheader("Export Results")
 report_figures = [("Footprint plan view", fig_to_png_bytes(fig_fp))]
 if across_sols:
     report_figures.append(("Cross-section view", fig_to_png_bytes(fig_xs)))
-if mc and multistrip_solutions:
-    report_figures.append(("Multi-strip plan view", fig_to_png_bytes(fig_ms)))
+# Multi-strip is exported separately as the 6-trigger version — skip from report_figures
+# if mc and multistrip_solutions:
+#     report_figures.append(("Multi-strip plan view", fig_to_png_bytes(fig_ms)))
 if coverage_fig_hits is not None:
     report_figures.append(("Point coverage heatmap - image hits", fig_to_png_bytes(coverage_fig_hits)))
 if coverage_fig_angles is not None:
