@@ -1678,16 +1678,11 @@ def parse_kml_aoi(path):
             coord_texts.append(elem.text)
 
     polygons = []
-    all_lonlat = []
-    lon0_ref = lat0_ref = None
     for coords_text in coord_texts:
         lonlat_ring = kml_ring_to_lonlat(coords_text)
         if len(lonlat_ring) < 4:
             continue
-        all_lonlat.extend(lonlat_ring)
-        local_ring, lon0, lat0 = lonlat_to_local_xy(lonlat_ring)
-        if lon0_ref is None:
-            lon0_ref, lat0_ref = lon0, lat0
+        local_ring, _, _ = lonlat_to_local_xy(lonlat_ring)
         try:
             poly = ShapelyPolygon(local_ring)
             if not poly.is_valid:
@@ -1704,20 +1699,11 @@ def parse_kml_aoi(path):
     if aoi_poly.is_empty:
         raise RuntimeError("The KML geometry did not produce a usable AOI polygon.")
 
-    # Store geographic reference so make_aoi_mission_figure can fetch map tiles
-    lons = [p[0] for p in all_lonlat]
-    lats = [p[1] for p in all_lonlat]
     return {
-        "name":     Path(path).stem,
-        "source":   "kml_library",
-        "polygon":  aoi_poly,
-        "area_m2":  float(aoi_poly.area),
-        "lon0":     float(lon0_ref) if lon0_ref is not None else None,
-        "lat0":     float(lat0_ref) if lat0_ref is not None else None,
-        "lon_min":  float(min(lons)),
-        "lon_max":  float(max(lons)),
-        "lat_min":  float(min(lats)),
-        "lat_max":  float(max(lats)),
+        "name": Path(path).stem,
+        "source": "kml_library",
+        "polygon": aoi_poly,
+        "area_m2": float(aoi_poly.area),
     }
 
 
@@ -1913,7 +1899,7 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
     return result
 
 
-def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, basemap_style="osm"):
+def make_aoi_mission_figure(mission_outputs, dist_unit="m"):
     if mission_outputs is None:
         return None
     polygon = mission_outputs.get("aoi_polygon")
@@ -1991,90 +1977,6 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune=None))
     except Exception:
         pass
-
-    # ── Basemap tile overlay ──
-    # Requires contextily and a geographic reference stored in the AOI payload.
-    # Falls back silently if contextily is not installed or the AOI has no geo ref.
-    if show_basemap:
-        lon0  = mission_outputs.get("lon0")
-        lat0  = mission_outputs.get("lat0")
-        lon_min = mission_outputs.get("lon_min")
-        lon_max = mission_outputs.get("lon_max")
-        lat_min = mission_outputs.get("lat_min")
-        lat_max = mission_outputs.get("lat_max")
-        if all(v is not None for v in [lon0, lat0, lon_min, lon_max, lat_min, lat_max]):
-            try:
-                import contextily as ctx
-                import pyproj
-
-                # Re-express the axes limits in Web Mercator (EPSG:3857)
-                # so contextily can fetch the right tiles.
-                transformer = pyproj.Transformer.from_crs(
-                    "EPSG:4326", "EPSG:3857", always_xy=True
-                )
-
-                # Convert local-metre axes limits back to lon/lat, then to Web Mercator
-                r = 6378137.0
-                cos_lat = math.cos(math.radians(lat0))
-
-                def local_to_lonlat(lx, ly):
-                    """Convert local-metre offset back to lon/lat."""
-                    lon = math.degrees(lx / (r * cos_lat)) + lon0
-                    lat = math.degrees(ly / r) + lat0
-                    return lon, lat
-
-                # Axes limits are already in display units (km or m).
-                # Convert back to metres for the local->lonlat transform.
-                lx_lo = x_lo; lx_hi = x_hi
-                ly_lo = y_lo; ly_hi = y_hi
-
-                ll_sw = local_to_lonlat(lx_lo, ly_lo)
-                ll_ne = local_to_lonlat(lx_hi, ly_hi)
-
-                merc_sw = transformer.transform(ll_sw[0], ll_sw[1])
-                merc_ne = transformer.transform(ll_ne[0], ll_ne[1])
-
-                # Create a temporary axes in Web Mercator to let contextily
-                # fetch tiles, then blend the tile image onto our axes.
-                fig_tmp, ax_tmp = plt.subplots(1, 1, figsize=(1, 1))
-                ax_tmp.set_xlim(merc_sw[0], merc_ne[0])
-                ax_tmp.set_ylim(merc_sw[1], merc_ne[1])
-
-                tile_source = (
-                    ctx.providers.Esri.WorldImagery
-                    if basemap_style == "satellite"
-                    else ctx.providers.OpenStreetMap.Mapnik
-                )
-                ctx.add_basemap(ax_tmp, source=tile_source, crs="EPSG:3857")
-
-                # Extract the tile image from the temporary axes
-                tile_img = None
-                for im in ax_tmp.get_images():
-                    tile_img = im
-                    break
-                plt.close(fig_tmp)
-
-                if tile_img is not None:
-                    # Get the tile image array and display it on our axes
-                    import numpy as np
-                    img_arr = tile_img.get_array()
-                    # Map the Web Mercator extent back to local display coordinates
-                    ax.imshow(
-                        img_arr,
-                        extent=[x_lo / scale, x_hi / scale, y_lo / scale, y_hi / scale],
-                        aspect="auto",
-                        origin="upper",
-                        alpha=0.55,
-                        zorder=1,
-                    )
-                    # Re-draw polygon and lines on top (zorder already set correctly)
-                    ax.set_xlim(x_lo / scale, x_hi / scale)
-                    ax.set_ylim(y_lo / scale, y_hi / scale)
-
-            except ImportError:
-                pass  # contextily not installed — silent fallback to no basemap
-            except Exception:
-                pass  # network error or other issue — silent fallback
 
     xt = ax.get_xticks()
     ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
@@ -2693,30 +2595,7 @@ else:
             f"{optimized_note}"
         )
 
-        _bm_col1, _bm_col2 = st.columns([1, 2])
-        with _bm_col1:
-            _show_basemap = st.checkbox(
-                "Show map backdrop",
-                value=True,
-                key="aoi_show_basemap",
-                help="Overlays OpenStreetMap or satellite imagery behind the flight lines. "
-                     "Only available for KML AOIs (requires geographic coordinates). "
-                     "Disable if tiles are slow to load.",
-            )
-        with _bm_col2:
-            _basemap_style = "osm"
-            if _show_basemap:
-                _basemap_style = st.radio(
-                    "Basemap style",
-                    ["osm", "satellite"],
-                    index=0,
-                    horizontal=True,
-                    key="aoi_basemap_style",
-                    format_func=lambda x: "OpenStreetMap" if x == "osm" else "Satellite (Esri)",
-                )
-        aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
-                                           show_basemap=_show_basemap,
-                                           basemap_style=_basemap_style)
+        aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit)
         if aoi_fig is not None:
             aoi_left, aoi_mid, aoi_right = st.columns([1.2, 2.6, 1.2])
             with aoi_mid:
