@@ -2067,8 +2067,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         else:
             _basemap_error = "No geographic reference in AOI — basemap only works with KML files, not the standard example."
 
-    return fig, _basemap_error
-
+    # Axis labels and title — always applied, after basemap so they sit on top
     xt = ax.get_xticks()
     ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
     yt = ax.get_yticks()
@@ -2077,7 +2076,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e")
     ax.set_title("AOI and generated flight lines", color="#c9d1d9", fontsize=11)
     fig.tight_layout()
-    return fig
+    return fig, _basemap_error
 
 
 # Apply any scenario requested on the previous run before widgets are created.
