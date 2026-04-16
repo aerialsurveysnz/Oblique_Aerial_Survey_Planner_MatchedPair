@@ -1636,49 +1636,84 @@ def kml_ring_to_lonlat(coords_text):
     return pts
 
 
-def lonlat_to_local_xy(points):
-    """Convert WGS84 lon/lat points to NZTM (EPSG:2193) easting/northing.
+def _detect_kml_crs(points):
+    """Detect whether KML coordinate values are WGS84 or NZTM.
 
-    NZTM is the standard NZ coordinate system — it gives accurate distances
-    and areas across New Zealand without the distortion of a flat-earth
-    approximation.  The returned coordinates are NZTM metres (easting, northing).
+    KML spec requires WGS84 but some GIS tools export in projected CRS.
+    NZTM eastings: ~1,000,000–2,000,000  northings: ~4,700,000–6,200,000
+    WGS84 lons:    ~166–178              lats:      ~-48 to -34
+
+    Returns 'nztm' or 'wgs84'.
+    """
+    if not points:
+        return "wgs84"
+    x_vals = [p[0] for p in points]
+    # NZTM eastings are always > 100,000; WGS84 lons never exceed 180
+    if min(x_vals) > 100_000:
+        return "nztm"
+    return "wgs84"
+
+
+def lonlat_to_local_xy(points):
+    """Convert KML coordinate points to NZTM-centred local metres.
+
+    Auto-detects whether the KML uses WGS84 or NZTM coordinates and
+    projects to NZTM (EPSG:2193) either way.  The output is centred on
+    the AOI centroid so axis values show offsets in km from the centre.
 
     Returns:
-        (nztm_points, lon0, lat0) where lon0/lat0 is the centroid in WGS84
-        (retained for backward compatibility with the basemap tile fetcher).
+        (local_points, lon0, lat0) where lon0/lat0 is the WGS84 centroid
+        (used by the basemap tile fetcher).
     """
     if not points:
         return [], 0.0, 0.0
-    lons = [p[0] for p in points]
-    lats = [p[1] for p in points]
-    lon0 = float(sum(lons) / len(lons))
-    lat0 = float(sum(lats) / len(lats))
+
     try:
         import pyproj
-        _wgs84_to_nztm = pyproj.Transformer.from_crs(
-            "EPSG:4326", "EPSG:2193", always_xy=True
-        )
-        nztm_pts = []
-        for lon, lat in points:
-            e, n = _wgs84_to_nztm.transform(lon, lat)
-            nztm_pts.append((e, n))
-        # Centre the polygon on its NZTM centroid so axes show
-        # offsets from the AOI centre in kilometres (easier to read).
+
+        crs = _detect_kml_crs(points)
+
+        if crs == "nztm":
+            # Already in NZTM — convert centroid to WGS84 for basemap reference
+            e_vals = [p[0] for p in points]
+            n_vals = [p[1] for p in points]
+            nztm_pts = list(points)
+            nztm_to_wgs84 = pyproj.Transformer.from_crs(
+                "EPSG:2193", "EPSG:4326", always_xy=True
+            )
+            e_cen = sum(e_vals) / len(e_vals)
+            n_cen = sum(n_vals) / len(n_vals)
+            lon0, lat0 = nztm_to_wgs84.transform(e_cen, n_cen)
+        else:
+            # WGS84 — project to NZTM, derive lon0/lat0 from input centroid
+            lons = [p[0] for p in points]
+            lats = [p[1] for p in points]
+            lon0 = float(sum(lons) / len(lons))
+            lat0 = float(sum(lats) / len(lats))
+            wgs84_to_nztm = pyproj.Transformer.from_crs(
+                "EPSG:4326", "EPSG:2193", always_xy=True
+            )
+            nztm_pts = [wgs84_to_nztm.transform(lon, lat) for lon, lat in points]
+
+        # Centre on NZTM centroid so axes show km offsets from AOI centre
         e_vals = [p[0] for p in nztm_pts]
         n_vals = [p[1] for p in nztm_pts]
         e0 = sum(e_vals) / len(e_vals)
         n0 = sum(n_vals) / len(n_vals)
         local = [(e - e0, n - n0) for e, n in nztm_pts]
         return local, lon0, lat0
+
     except ImportError:
-        # pyproj not available — fall back to flat-earth approximation
+        # pyproj not available — flat-earth fallback
+        lons = [p[0] for p in points]
+        lats = [p[1] for p in points]
+        lon0 = float(sum(lons) / len(lons))
+        lat0 = float(sum(lats) / len(lats))
         r = 6378137.0
         cos_lat = math.cos(math.radians(lat0))
-        local = []
-        for lon, lat in points:
-            x = r * math.radians(lon - lon0) * cos_lat
-            y = r * math.radians(lat - lat0)
-            local.append((x, y))
+        local = [(r * math.radians(lon - lon0) * cos_lat,
+                  r * math.radians(lat - lat0))
+                 for lon, lat in points]
         return local, lon0, lat0
 
 
@@ -1706,17 +1741,85 @@ def parse_kml_aoi(path):
         if str(elem.tag).lower().endswith("coordinates") and (elem.text or "").strip():
             coord_texts.append(elem.text)
 
-    polygons = []
+    # ── Pass 1: collect all raw lonlat points and build a temporary polygon
+    # using a simple flat-earth projection to get the Shapely polygon ──────────
     all_lonlat = []
-    lon0_ref = lat0_ref = None
+    temp_polygons = []
     for coords_text in coord_texts:
         lonlat_ring = kml_ring_to_lonlat(coords_text)
         if len(lonlat_ring) < 4:
             continue
         all_lonlat.extend(lonlat_ring)
-        local_ring, lon0, lat0 = lonlat_to_local_xy(lonlat_ring)
-        if lon0_ref is None:
-            lon0_ref, lat0_ref = lon0, lat0
+        # Temporary flat-earth local ring just to build the Shapely polygon
+        _, _lon0, _lat0 = lonlat_to_local_xy(lonlat_ring)
+        local_ring, _, _ = lonlat_to_local_xy(lonlat_ring)
+        try:
+            poly = ShapelyPolygon(local_ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty and poly.area > 0:
+                temp_polygons.append((lonlat_ring, poly))
+        except Exception:
+            continue
+
+    if not temp_polygons:
+        raise RuntimeError("No valid polygon coordinates were found in that KML.")
+
+    # ── Detect CRS and compute WGS84 bounds ──────────────────────────────────
+    crs = _detect_kml_crs(all_lonlat)
+    lons_raw = [p[0] for p in all_lonlat]
+    lats_raw = [p[1] for p in all_lonlat]
+
+    if crs == "nztm":
+        try:
+            import pyproj as _pj
+            _n2w = _pj.Transformer.from_crs("EPSG:2193","EPSG:4326",always_xy=True)
+            sw = _n2w.transform(min(lons_raw), min(lats_raw))
+            ne = _n2w.transform(max(lons_raw), max(lats_raw))
+            _lon_min, _lat_min = min(sw[0],ne[0]), min(sw[1],ne[1])
+            _lon_max, _lat_max = max(sw[0],ne[0]), max(sw[1],ne[1])
+        except ImportError:
+            _lon_min,_lon_max = float(min(lons_raw)),float(max(lons_raw))
+            _lat_min,_lat_max = float(min(lats_raw)),float(max(lats_raw))
+    else:
+        _lon_min,_lon_max = float(min(lons_raw)),float(max(lons_raw))
+        _lat_min,_lat_max = float(min(lats_raw)),float(max(lats_raw))
+
+    # ── Use the geographic bounds centre as the projection origin ─────────────
+    # This is the area-proportional centroid of the bounding box — much more
+    # stable than averaging vertex coordinates (which are biased by vertex density).
+    lon0 = 0.5 * (_lon_min + _lon_max)
+    lat0 = 0.5 * (_lat_min + _lat_max)
+
+    # ── Pass 2: re-project all rings relative to the stable lon0/lat0 origin ─
+    try:
+        import pyproj as _pj
+        _wgs_nztm = _pj.Transformer.from_crs("EPSG:4326","EPSG:2193",always_xy=True)
+        _nztm_wgs = _pj.Transformer.from_crs("EPSG:2193","EPSG:4326",always_xy=True)
+        # NZTM easting/northing of the projection origin
+        e0, n0 = _wgs_nztm.transform(lon0, lat0)
+        use_nztm = True
+    except ImportError:
+        use_nztm = False
+        r = 6378137.0
+        cos_lat = math.cos(math.radians(lat0))
+
+    polygons = []
+    for lonlat_ring, _ in temp_polygons:
+        if crs == "nztm" and use_nztm:
+            # Already NZTM — just offset from origin
+            local_ring = [(p[0] - e0, p[1] - n0) for p in lonlat_ring]
+        elif use_nztm:
+            # WGS84 → NZTM → offset from NZTM origin
+            nztm_pts = [_wgs_nztm.transform(lon, lat) for lon, lat in lonlat_ring]
+            local_ring = [(e - e0, n - n0) for e, n in nztm_pts]
+        else:
+            # Flat-earth fallback
+            local_ring = [
+                (r * math.radians(lon - lon0) * cos_lat,
+                 r * math.radians(lat - lat0))
+                for lon, lat in lonlat_ring
+            ]
         try:
             poly = ShapelyPolygon(local_ring)
             if not poly.is_valid:
@@ -1733,20 +1836,17 @@ def parse_kml_aoi(path):
     if aoi_poly.is_empty:
         raise RuntimeError("The KML geometry did not produce a usable AOI polygon.")
 
-    # Store geographic reference so make_aoi_mission_figure can fetch map tiles
-    lons = [p[0] for p in all_lonlat]
-    lats = [p[1] for p in all_lonlat]
     return {
         "name":     Path(path).stem,
         "source":   "kml_library",
         "polygon":  aoi_poly,
         "area_m2":  float(aoi_poly.area),
-        "lon0":     float(lon0_ref) if lon0_ref is not None else None,
-        "lat0":     float(lat0_ref) if lat0_ref is not None else None,
-        "lon_min":  float(min(lons)),
-        "lon_max":  float(max(lons)),
-        "lat_min":  float(min(lats)),
-        "lat_max":  float(max(lats)),
+        "lon0":     float(lon0),
+        "lat0":     float(lat0),
+        "lon_min":  _lon_min,
+        "lon_max":  _lon_max,
+        "lat_min":  _lat_min,
+        "lat_max":  _lat_max,
     }
 
 
