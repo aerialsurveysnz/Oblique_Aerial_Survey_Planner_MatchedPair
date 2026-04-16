@@ -1874,6 +1874,14 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "lead_in_out_m": float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
         "aoi_polygon": polygon,
+        # Geographic reference — passed through from aoi_payload so
+        # make_aoi_mission_figure can fetch map tiles for the correct location.
+        "lon0":    aoi_payload.get("lon0"),
+        "lat0":    aoi_payload.get("lat0"),
+        "lon_min": aoi_payload.get("lon_min"),
+        "lon_max": aoi_payload.get("lon_max"),
+        "lat_min": aoi_payload.get("lat_min"),
+        "lat_max": aoi_payload.get("lat_max"),
     }
 
 
