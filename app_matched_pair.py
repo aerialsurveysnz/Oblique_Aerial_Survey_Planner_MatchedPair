@@ -1821,36 +1821,45 @@ def parse_kml_aoi(path):
     lon0 = 0.5 * (_lon_min + _lon_max)
     lat0 = 0.5 * (_lat_min + _lat_max)
 
-    # ── Pass 2: re-project all rings relative to the stable lon0/lat0 origin ─
+    # ── Pass 2: project all rings into Web Mercator (EPSG:3857) offsets ────────
+    # Using Web Mercator for the polygon means the basemap tile fetch (also in
+    # EPSG:3857) uses exactly the same coordinate system — no conversion error.
+    # We store the Web Mercator position of the bbox centre (mx0, my0) so the
+    # basemap code can reconstruct absolute Mercator coords from local offsets.
     try:
         import pyproj as _pj
-        _wgs_nztm = _pj.Transformer.from_crs("EPSG:4326","EPSG:2193",always_xy=True)
+        _wgs_merc = _pj.Transformer.from_crs("EPSG:4326","EPSG:3857",always_xy=True)
+        # If KML is in NZTM, convert to WGS84 first
         _nztm_wgs = _pj.Transformer.from_crs("EPSG:2193","EPSG:4326",always_xy=True)
-        # NZTM easting/northing of the projection origin
-        e0, n0 = _wgs_nztm.transform(lon0, lat0)
-        use_nztm = True
+        # Web Mercator position of the projection origin (bbox centre)
+        mx0, my0 = _wgs_merc.transform(lon0, lat0)
+        use_merc = True
     except ImportError:
-        use_nztm = False
+        use_merc = False
+        mx0 = my0 = 0.0
         r = 6378137.0
         cos_lat = math.cos(math.radians(lat0))
 
     polygons = []
     for lonlat_ring, _ in temp_polygons:
-        if crs == "nztm" and use_nztm:
-            # Already NZTM — just offset from origin
-            local_ring = [(p[0] - e0, p[1] - n0) for p in lonlat_ring]
-        elif use_nztm:
-            # WGS84 → NZTM → offset from NZTM origin
-            nztm_pts = [_wgs_nztm.transform(lon, lat) for lon, lat in lonlat_ring]
-            local_ring = [(e - e0, n - n0) for e, n in nztm_pts]
-        else:
-            # Flat-earth fallback
-            local_ring = [
-                (r * math.radians(lon - lon0) * cos_lat,
-                 r * math.radians(lat - lat0))
-                for lon, lat in lonlat_ring
-            ]
         try:
+            if use_merc:
+                if crs == "nztm":
+                    # NZTM → WGS84 → Web Mercator
+                    wgs_ring = [_nztm_wgs.transform(e, n) for e, n in lonlat_ring]
+                    merc_ring = [_wgs_merc.transform(lon, lat) for lon, lat in wgs_ring]
+                else:
+                    # WGS84 → Web Mercator
+                    merc_ring = [_wgs_merc.transform(lon, lat) for lon, lat in lonlat_ring]
+                # Offset from Mercator origin so local (0,0) = bbox centre
+                local_ring = [(mx - mx0, my - my0) for mx, my in merc_ring]
+            else:
+                # Flat-earth fallback (no pyproj)
+                local_ring = [
+                    (r * math.radians(lon - lon0) * cos_lat,
+                     r * math.radians(lat - lat0))
+                    for lon, lat in lonlat_ring
+                ]
             poly = ShapelyPolygon(local_ring)
             if not poly.is_valid:
                 poly = poly.buffer(0)
@@ -1873,6 +1882,8 @@ def parse_kml_aoi(path):
         "area_m2":  float(aoi_poly.area),
         "lon0":     float(lon0),
         "lat0":     float(lat0),
+        "mx0":      float(mx0),   # Web Mercator X of bbox centre
+        "my0":      float(my0),   # Web Mercator Y of bbox centre
         "lon_min":  _lon_min,
         "lon_max":  _lon_max,
         "lat_min":  _lat_min,
@@ -2037,6 +2048,8 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         # make_aoi_mission_figure can fetch map tiles for the correct location.
         "lon0":    aoi_payload.get("lon0"),
         "lat0":    aoi_payload.get("lat0"),
+        "mx0":     aoi_payload.get("mx0"),
+        "my0":     aoi_payload.get("my0"),
         "lon_min": aoi_payload.get("lon_min"),
         "lon_max": aoi_payload.get("lon_max"),
         "lat_min": aoi_payload.get("lat_min"),
@@ -2191,27 +2204,23 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 #  3. After fetching, set the image extent using the SAME
                 #     local-metre values so the tile aligns with the polygon.
 
-                # ── Tile alignment strategy ────────────────────────────────
-                # The polygon is drawn in flat-earth local metres centred on
-                # (lon0, lat0):  x = R·Δlon·cos(lat0),  y = R·Δlat
-                # To align the tile perfectly, fetch it in WGS84 (EPSG:4326)
-                # with axes limits set to the WGS84 lon/lat that correspond to
-                # x_lo/x_hi/y_lo/y_hi, then rescale the image back to those
-                # same local metre values.  This avoids any NZTM↔WebMercator
-                # distortion entirely.
+                # ── Tile alignment ─────────────────────────────────────────
+                # The polygon is stored in Web Mercator offsets from (mx0,my0).
+                # x_lo/x_hi/y_lo/y_hi are those same Mercator offsets (metres).
+                # Adding mx0/my0 gives absolute Web Mercator coordinates, which
+                # contextily uses directly — no conversion, no mismatch.
 
-                _r      = 6378137.0
-                _coslat = math.cos(math.radians(lat0))
+                mx0 = float(mission_outputs.get("mx0") or 0.0)
+                my0 = float(mission_outputs.get("my0") or 0.0)
 
-                # Local metres → WGS84 (exact inverse of flat-earth formula)
-                sw_lon = math.degrees(x_lo / (_r * _coslat)) + lon0
-                sw_lat = math.degrees(y_lo / _r) + lat0
-                ne_lon = math.degrees(x_hi / (_r * _coslat)) + lon0
-                ne_lat = math.degrees(y_hi / _r) + lat0
+                merc_w = mx0 + x_lo
+                merc_e = mx0 + x_hi
+                merc_s = my0 + y_lo
+                merc_n = my0 + y_hi
 
-                # Temporarily set axes to WGS84 lon/lat for tile fetching
-                ax.set_xlim(sw_lon, ne_lon)
-                ax.set_ylim(sw_lat, ne_lat)
+                # Set axes to Web Mercator for tile fetching
+                ax.set_xlim(merc_w, merc_e)
+                ax.set_ylim(merc_s, merc_n)
 
                 tile_source = (
                     ctx.providers.Esri.WorldImagery
@@ -2220,7 +2229,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 )
                 ctx.add_basemap(
                     ax,
-                    crs="EPSG:4326",
+                    crs="EPSG:3857",
                     source=tile_source,
                     alpha=0.65,
                     zorder=1,
@@ -2232,10 +2241,9 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ax.set_xlim(x_lo / scale, x_hi / scale)
                 ax.set_ylim(y_lo / scale, y_hi / scale)
 
-                # The tile image spans sw_lon→ne_lon / sw_lat→ne_lat in WGS84,
-                # which by construction equals x_lo→x_hi / y_lo→y_hi in local
-                # metres — so setting the extent to the display limits aligns
-                # the tile perfectly with the polygon.
+                # The tile spans merc_w→merc_e / merc_s→merc_n in Web Mercator,
+                # which equals x_lo→x_hi / y_lo→y_hi in local Mercator offsets.
+                # Setting the image extent to display units aligns it exactly.
                 for img in ax.get_images():
                     img.set_extent([x_lo / scale, x_hi / scale,
                                     y_lo / scale, y_hi / scale])
@@ -2259,8 +2267,8 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     yt = ax.get_yticks()
     ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt],
                         color="#8b949e", fontsize=8)
-    ax.set_xlabel(f"NZTM Easting offset ({axis_unit})", color="#8b949e", fontsize=9)
-    ax.set_ylabel(f"NZTM Northing offset ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_xlabel(f"Easting offset ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_ylabel(f"Northing offset ({axis_unit})", color="#8b949e", fontsize=9)
     _aoi_name = mission_outputs.get("name", "AOI")
     ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
     ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
