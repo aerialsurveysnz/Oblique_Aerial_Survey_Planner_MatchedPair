@@ -2100,7 +2100,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     if polygon is None or getattr(polygon, "is_empty", True):
         return None
 
-    fig, ax = dark_fig(6.5, 6.5)
+    fig, ax = dark_fig(7.0, 7.0)
     ax.set_aspect("equal")
 
     all_x = []
@@ -2128,7 +2128,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         x_mid = 0.5 * (x_min + x_max)
         y_mid = 0.5 * (y_min + y_max)
         half_span = 0.5 * max(x_span, y_span)
-        pad = max(half_span * 0.22, 1.0)  # 22% padding gives context around the AOI
+        pad = max(half_span * 0.18, 1.0)  # 18% padding gives context around the AOI
         x_lo, x_hi = x_mid - half_span - pad, x_mid + half_span + pad
         y_lo, y_hi = y_mid - half_span - pad, y_mid + half_span + pad
     else:
@@ -2213,45 +2213,60 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 mx0 = float(mission_outputs.get("mx0") or 0.0)
                 my0 = float(mission_outputs.get("my0") or 0.0)
 
+                # Absolute Web Mercator extent for tile fetch
                 merc_w = mx0 + x_lo
                 merc_e = mx0 + x_hi
                 merc_s = my0 + y_lo
                 merc_n = my0 + y_hi
-
-                # Set axes to Web Mercator for tile fetching
-                ax.set_xlim(merc_w, merc_e)
-                ax.set_ylim(merc_s, merc_n)
 
                 tile_source = (
                     ctx.providers.Esri.WorldImagery
                     if basemap_style == "satellite"
                     else ctx.providers.OpenStreetMap.Mapnik
                 )
+
+                # Fetch tiles into a temporary figure so we can extract the
+                # raw pixel array and place it at exactly the right local coords.
+                # This avoids any coordinate transform ambiguity from contextily.
+                _fig_tmp, _ax_tmp = plt.subplots(1, 1, figsize=(2, 2))
+                _ax_tmp.set_xlim(merc_w, merc_e)
+                _ax_tmp.set_ylim(merc_s, merc_n)
                 ctx.add_basemap(
-                    ax,
+                    _ax_tmp,
                     crs="EPSG:3857",
                     source=tile_source,
-                    alpha=0.65,
-                    zorder=1,
                     reset_extent=False,
-                    attribution_size=5,
+                    attribution_size=1,
                 )
+                _tile_arr = None
+                for _im in _ax_tmp.get_images():
+                    _raw = _im.get_array()
+                    if _raw is not None and _raw.ndim >= 2:
+                        _tile_arr = _raw
+                        break
+                plt.close(_fig_tmp)
 
-                # Restore local display coordinate limits
-                ax.set_xlim(x_lo / scale, x_hi / scale)
-                ax.set_ylim(y_lo / scale, y_hi / scale)
+                # Place tile pixels at local display coordinates.
+                # The tile covers merc_w..merc_e / merc_s..merc_n in Mercator.
+                # In local offset coords (subtract mx0/my0) that is x_lo..x_hi / y_lo..y_hi.
+                # In display units (divide by scale) that is x_lo/s .. x_hi/s.
+                if _tile_arr is not None:
+                    ax.imshow(
+                        _tile_arr,
+                        extent=[x_lo / scale, x_hi / scale,
+                                y_lo / scale, y_hi / scale],
+                        aspect="auto",
+                        origin="upper",
+                        alpha=0.65,
+                        zorder=1,
+                    )
 
-                # The tile spans merc_w→merc_e / merc_s→merc_n in Web Mercator,
-                # which equals x_lo→x_hi / y_lo→y_hi in local Mercator offsets.
-                # Setting the image extent to display units aligns it exactly.
-                for img in ax.get_images():
-                    img.set_extent([x_lo / scale, x_hi / scale,
-                                    y_lo / scale, y_hi / scale])
-
-                # Minimise attribution text
-                for txt in ax.texts:
-                    txt.set_fontsize(5)
-                    txt.set_alpha(0.6)
+                # Attribution text
+                ax.annotate(
+                    "© OpenStreetMap contributors" if basemap_style != "satellite" else "© Esri",
+                    xy=(0.01, 0.01), xycoords="axes fraction",
+                    fontsize=5, color="#aaaaaa", alpha=0.7, zorder=5,
+                )
 
             except ImportError:
                 _basemap_error = "contextily / pyproj not installed — reboot app to install packages."
@@ -2272,7 +2287,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     _aoi_name = mission_outputs.get("name", "AOI")
     ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
     ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
-    fig.tight_layout(pad=1.2)
+    fig.tight_layout(pad=1.5)
     return fig, _basemap_error
 
 
