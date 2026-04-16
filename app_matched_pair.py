@@ -540,46 +540,132 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
 
 
 def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None):
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
+    from openpyxl.utils import get_column_letter
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    C_HEADER_BG  = "1F4E79"   # dark blue header
+    C_HEADER_FG  = "FFFFFF"   # white header text
+    C_SUBHDR_BG  = "D6E4F0"   # pale blue subheader
+    C_SUBHDR_FG  = "1F4E79"   # dark blue subheader text
+    C_ROW_ALT    = "EBF3FB"   # alternating row tint
+    C_BORDER     = "BFBFBF"   # light grey border
+
+    thin  = Side(style="thin",   color=C_BORDER)
+    thick = Side(style="medium", color="1F4E79")
+    bdr_cell  = Border(left=thin,  right=thin,  top=thin,  bottom=thin)
+    bdr_outer = Border(left=thick, right=thick, top=thick, bottom=thick)
+
+    def hdr_font(sz=10):  return Font(name="Arial", bold=True, color=C_HEADER_FG, size=sz)
+    def sub_font(sz=10):  return Font(name="Arial", bold=True, color=C_SUBHDR_FG, size=sz)
+    def body_font(sz=10): return Font(name="Arial", size=sz)
+    def hdr_fill():       return PatternFill("solid", fgColor=C_HEADER_BG)
+    def alt_fill():       return PatternFill("solid", fgColor=C_ROW_ALT)
+    def sub_fill():       return PatternFill("solid", fgColor=C_SUBHDR_BG)
+    def wrap_align():     return Alignment(wrap_text=True, vertical="center")
+    def ctr_align():      return Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def style_header_row(ws, row_num, ncols):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=row_num, column=c)
+            cell.font  = hdr_font()
+            cell.fill  = hdr_fill()
+            cell.alignment = ctr_align()
+            cell.border = bdr_cell
+
+    def style_data_rows(ws, start_row, end_row, ncols):
+        for r in range(start_row, end_row + 1):
+            use_alt = (r - start_row) % 2 == 1
+            for c in range(1, ncols + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.font      = body_font()
+                cell.alignment = wrap_align()
+                cell.border    = bdr_cell
+                if use_alt:
+                    cell.fill = alt_fill()
+
+    def auto_col_width(ws, min_w=12, max_w=50):
+        for col in ws.columns:
+            best = min_w
+            for cell in col:
+                if cell.value:
+                    best = max(best, min(max_w, len(str(cell.value)) + 4))
+            ws.column_dimensions[get_column_letter(col[0].column)].width = best
+
+    def sheet_title(ws, title):
+        ws.sheet_view.showGridLines = False
+        ws.row_dimensions[1].height = 22
+        cell = ws.cell(row=1, column=1, value=title)
+        cell.font      = Font(name="Arial", bold=True, size=13, color=C_HEADER_FG)
+        cell.fill      = hdr_fill()
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
     wb = Workbook()
 
+    # ── Sheet 1: Settings ─────────────────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Settings"
-    for row in settings_rows:
-        ws1.append(row)
+    sheet_title(ws1, "Survey Settings")
+    ws1.append([])  # blank row 2
+    ws1.append(["Parameter", "Value"])
+    style_header_row(ws1, 3, 2)
+    for i, row in enumerate(settings_rows):
+        ws1.append(list(row))
+        style_data_rows(ws1, 4 + i, 4 + i, 2)
+    ws1.merge_cells("A1:B1")
+    auto_col_width(ws1)
+    ws1.freeze_panes = "A4"
 
+    # ── Sheet 2: System Summary ───────────────────────────────────────────────
     ws2 = wb.create_sheet("System Summary")
-    for row in system_rows:
-        ws2.append(row)
+    sheet_title(ws2, "System Summary")
+    ws2.append([])
+    ws2.append(["Metric", "Value"])
+    style_header_row(ws2, 3, 2)
+    for i, row in enumerate(system_rows):
+        ws2.append(list(row))
+        style_data_rows(ws2, 4 + i, 4 + i, 2)
+    ws2.merge_cells("A1:B1")
+    auto_col_width(ws2)
+    ws2.freeze_panes = "A4"
 
+    # ── Sheet 3: Camera Results ───────────────────────────────────────────────
     ws3 = wb.create_sheet("Camera Results")
-    ws3.append([
-        "Camera",
-        "Inner edge oblique (deg)",
-        "Outer edge oblique (deg)",
-        "Near angle (deg)",
-        "Near class",
-        "Far angle (deg)",
-        "Far class",
-        "Inner GSD (cm/px)",
-        "Centre GSD (cm/px)",
-        "Outer GSD (cm/px)",
-        "Inner edge (m)",
-        "Centre (m)",
-        "Outer edge (m)",
-    ])
+    sheet_title(ws3, "Per-Camera Results")
+    ws3.append([])
+    headers3 = [
+        "Camera", "Inner oblique (°)", "Outer oblique (°)",
+        "Near angle (°)", "Near class", "Far angle (°)", "Far class",
+        "Inner GSD (cm/px)", "Centre GSD (cm/px)", "Outer GSD (cm/px)",
+        "Inner edge (m)", "Centre (m)", "Outer edge (m)",
+    ]
+    ws3.append(headers3)
+    style_header_row(ws3, 3, len(headers3))
+    ws3.merge_cells(f"A1:{get_column_letter(len(headers3))}1")
+    for i, row in enumerate(camera_rows):
+        ws3.append(list(row))
+        style_data_rows(ws3, 4 + i, 4 + i, len(headers3))
+    auto_col_width(ws3, min_w=10, max_w=22)
+    ws3.freeze_panes = "B4"
+    ws3.row_dimensions[3].height = 36  # taller header for wrapped text
 
-    for row in camera_rows:
-        ws3.append(row)
-
+    # ── Sheet 4: Sample Area / Mission ───────────────────────────────────────
     if mission_rows:
         ws4 = wb.create_sheet("Sample Area")
+        sheet_title(ws4, "Sample Area & Flight Plan")
+        ws4.append([])
         ws4.append(["Metric", "Value"])
-        for row in mission_rows:
-            ws4.append(row)
+        style_header_row(ws4, 3, 2)
+        for i, row in enumerate(mission_rows):
+            ws4.append(list(row))
+            style_data_rows(ws4, 4 + i, 4 + i, 2)
+        ws4.merge_cells("A1:B1")
+        auto_col_width(ws4)
+        ws4.freeze_panes = "A4"
         if mission_figure_bytes:
             try:
                 img = XLImage(io.BytesIO(mission_figure_bytes))
-                img.width = 520
+                img.width  = 520
                 img.height = 390
                 ws4.add_image(img, "D2")
             except Exception:
@@ -647,6 +733,7 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
         if mission_figure_bytes:
             title_p = doc.add_paragraph("Sample area and generated flight lines")
             title_p.paragraph_format.keep_with_next = True
+            title_p.paragraph_format.page_break_before = True
             doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(9.0))
 
     doc.add_heading("Camera results", level=2)
@@ -679,7 +766,8 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 
     # ── Point coverage summary table ─────────────────────────────────────────
     if coverage_summary_data:
-        doc.add_heading("Point coverage summary", level=2)
+        h_cov = doc.add_heading("Point coverage summary", level=2)
+        h_cov.paragraph_format.page_break_before = True
         cov_table = doc.add_table(rows=1, cols=3)
         set_table_style(cov_table, "Light Grid Accent 1")
         hdr_cov = cov_table.rows[0].cells
@@ -698,7 +786,9 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 
     # ── 6-trigger multi-strip graphic ─────────────────────────────────────────
     if fig_ms_6trigger_bytes:
-        doc.add_heading("Multi-strip coverage — 6 trigger instances", level=2)
+        h6 = doc.add_heading("Multi-strip coverage — 6 trigger instances", level=2)
+        h6.paragraph_format.page_break_before = True
+        h6.paragraph_format.keep_with_next = True
         p6 = doc.add_paragraph(
             "Three adjacent strips showing 6 successive trigger instances per strip. "
             "Illustrates forward overlap, sidelap, and the matched-frame cross-track coverage band."
@@ -708,7 +798,9 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 
     # ── Coverage diagrams ─────────────────────────────────────────────────────
     if report_figures:
-        doc.add_heading("Coverage diagrams", level=2)
+        h_diag = doc.add_heading("Coverage diagrams", level=2)
+        h_diag.paragraph_format.page_break_before = True
+        h_diag.paragraph_format.keep_with_next = True
         for figure_title, figure_bytes in report_figures:
             para = doc.add_paragraph(figure_title)
             para.paragraph_format.keep_with_next = True
@@ -2153,7 +2245,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ix, iy = interior.xy
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
-    _plot_poly(polygon, edgecolor="#58a6ff", facealpha=0.08, lw=1.5)
+    _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
 
     for line in mission_outputs.get("mission_line_geometries", []):
         try:
