@@ -295,7 +295,108 @@ def is_scenario_payload(data):
 def save_scenario(data, name):
     path = scenario_path_from_name(name)
     path.write_text(json.dumps(data, indent=2, default=str))
+    # Also push to GitHub if token is configured — persists across reboots
+    _gh_push_scenario(name, json.dumps(data, indent=2, default=str))
     return path
+
+
+def _gh_config():
+    """Return (token, repo, branch, folder) from st.secrets, or None if not set."""
+    try:
+        sec = st.secrets.get("github", {})
+        token  = sec.get("token")
+        repo   = sec.get("repo")
+        branch = sec.get("branch", "main")
+        folder = sec.get("scenarios_folder", "saved_scenarios")
+        if token and repo:
+            return token, repo, branch, folder
+    except Exception:
+        pass
+    return None
+
+
+def _gh_push_scenario(name, json_text):
+    """Push a scenario JSON file to GitHub. Silent on failure."""
+    cfg = _gh_config()
+    if cfg is None:
+        return
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request, base64
+        filename = name if name.endswith(".json") else f"{name}.json"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}/{filename}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        }
+        # Check if file already exists (need its SHA to update)
+        sha = None
+        req = urllib.request.Request(api_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                sha = json.loads(resp.read()).get("sha")
+        except Exception:
+            pass
+        payload = {
+            "message": f"Save scenario: {filename}",
+            "content": base64.b64encode(json_text.encode()).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+        with urllib.request.urlopen(req):
+            pass
+    except Exception:
+        pass
+
+
+def _gh_list_scenarios():
+    """List scenario files from GitHub. Returns list of (name, json_text) or []."""
+    cfg = _gh_config()
+    if cfg is None:
+        return []
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request, base64
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            items = json.loads(resp.read())
+        results = []
+        for item in items:
+            if item.get("name", "").endswith(".json"):
+                # Fetch file content
+                dl_url = item.get("download_url")
+                if dl_url:
+                    req2 = urllib.request.Request(dl_url, headers={"Authorization": f"token {token}"})
+                    with urllib.request.urlopen(req2) as r:
+                        results.append((item["name"], r.read().decode()))
+        return results
+    except Exception:
+        return []
+
+
+def _sync_scenarios_from_github():
+    """Pull scenario files from GitHub into local SCENARIO_DIR. Call once on startup."""
+    cfg = _gh_config()
+    if cfg is None:
+        return
+    ensure_scenario_dir()
+    for filename, json_text in _gh_list_scenarios():
+        local_path = SCENARIO_DIR / filename
+        try:
+            data = json.loads(json_text)
+            if is_scenario_payload(data):
+                local_path.write_text(json_text)
+        except Exception:
+            pass
 
 
 def load_scenario(path_or_name):
@@ -831,6 +932,11 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 # Session state
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Sync scenarios from GitHub once per session (persists across Cloud reboots)
+if "gh_scenarios_synced" not in st.session_state:
+    _sync_scenarios_from_github()
+    st.session_state.gh_scenarios_synced = True
+
 if "cameras" not in st.session_state:
     st.session_state.cameras = [dict(c) for c in DEFAULT_CAMERAS]
 if "planner_altitude_m" not in st.session_state:
@@ -885,11 +991,11 @@ def obliqueness_ratio(sol):
 
 def dark_fig(w=12, h=6):
     fig, ax = plt.subplots(figsize=(w, h))
-    fig.patch.set_facecolor("#0d1117")
-    ax.set_facecolor("#161b22")
-    ax.tick_params(colors="#8b949e", labelsize=8)
+    fig.patch.set_facecolor("#1a2332")   # dark navy — lighter than pure black
+    ax.set_facecolor("#1e2d40")          # slightly lighter navy for plot area
+    ax.tick_params(colors="#a0aec0", labelsize=8)
     for sp in ax.spines.values():
-        sp.set_color("#30363d")
+        sp.set_color("#3d5166")
     return fig, ax
 
 def corner_inner_outer(sol):
@@ -3078,8 +3184,8 @@ ax_fp.set_xlim(-lim, lim)
 ax_fp.set_ylim(-lim, lim)
 
 # Grid / nadir
-ax_fp.axhline(0, color="#21262d", lw=0.8, zorder=1)
-ax_fp.axvline(0, color="#21262d", lw=0.8, zorder=1)
+ax_fp.axhline(0, color="#243447", lw=0.8, zorder=1)
+ax_fp.axvline(0, color="#243447", lw=0.8, zorder=1)
 ax_fp.scatter([0], [0], s=200, color="#f0c040", zorder=8, marker="x", linewidths=2.5)
 ax_fp.annotate("Nadir", (0, 0), xytext=(8, -14), textcoords="offset points",
                color="#f0c040", fontsize=8.5, fontweight="bold")
@@ -3113,13 +3219,13 @@ for cam, sol, colour in solutions:
         ha="center",
         va="center",
         zorder=7,
-        bbox=dict(facecolor="#0d1117", alpha=0.70, pad=2.5, edgecolor=colour, linewidth=0.8, boxstyle="round,pad=0.3"),
+        bbox=dict(facecolor="#1a2332", alpha=0.70, pad=2.5, edgecolor=colour, linewidth=0.8, boxstyle="round,pad=0.3"),
     )
 
     inner_gx, outer_gx = corner_inner_outer(sol)
     inner_len, outer_len = along_lengths_for_display(sol)
     (it, ib), (ot, ob) = inner_outer_corners(sol)
-    label_box = dict(facecolor="#0d1117", alpha=0.82, edgecolor=colour, linewidth=0.6, boxstyle="round,pad=0.18")
+    label_box = dict(facecolor="#1a2332", alpha=0.82, edgecolor=colour, linewidth=0.6, boxstyle="round,pad=0.18")
 
     if sol.tilt_axis == "across":
         ap = dict(arrowstyle="-|>", lw=1.3, mutation_scale=11)
@@ -3255,7 +3361,7 @@ ax_fp.set_title("Single-Frame Footprint Plan View — All Cameras", color="#c9d1
 legend_fp = [mpatches.Patch(color=col, label=cam["label"], alpha=0.85)
              for cam, _, col in solutions]
 ax_fp.legend(handles=legend_fp, loc="upper right", fontsize=8, framealpha=0.4,
-             labelcolor="#c9d1d9", facecolor="#161b22")
+             labelcolor="#c9d1d9", facecolor="#1e2d40")
 
 # Forward arrow
 ax_fp.annotate("", xy=(0, lim * 0.90), xytext=(0, lim * 0.74),
@@ -3359,7 +3465,7 @@ if across_sols:
         plt.Line2D([0],[0], color="white", ls="--", lw=1.4, label="Outer edge ray"),
     ]
     ax_xs.legend(handles=legend_xs, fontsize=7, framealpha=0.35,
-                 labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right", ncol=2)
+                 labelcolor="#c9d1d9", facecolor="#1e2d40", loc="upper right", ncol=2)
 
     fig_xs.tight_layout()
     st.pyplot(fig_xs)
@@ -3485,7 +3591,7 @@ if mc and multistrip_solutions:
             fontsize=7,
             ha="center",
             va="bottom",
-            bbox=dict(facecolor="#21262d", alpha=0.80, pad=3, edgecolor="#c9d1d9", lw=0.6),
+            bbox=dict(facecolor="#243447", alpha=0.80, pad=3, edgecolor="#c9d1d9", lw=0.6),
             zorder=6,
         )
 
@@ -3508,7 +3614,7 @@ if mc and multistrip_solutions:
             fontsize=8,
             ha="center",
             va="top",
-            bbox=dict(facecolor="#21262d", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
+            bbox=dict(facecolor="#243447", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
         )
 
         x_for_photo = min(all_x_ms) - 0.06 * x_range
@@ -3527,7 +3633,7 @@ if mc and multistrip_solutions:
             fontsize=8,
             ha="left",
             va="center",
-            bbox=dict(facecolor="#21262d", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
+            bbox=dict(facecolor="#243447", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
         )
 
         x_min = min(all_x_ms) - 0.12 * x_range
@@ -3551,7 +3657,7 @@ if mc and multistrip_solutions:
     legend_ms = [mpatches.Patch(color=col, label=cam["label"], alpha=0.8)
                  for cam, _, col in multistrip_solutions]
     ax_ms.legend(handles=legend_ms, fontsize=8, framealpha=0.35,
-                 labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right")
+                 labelcolor="#c9d1d9", facecolor="#1e2d40", loc="upper right")
 
     fig_ms.tight_layout()
     st.pyplot(fig_ms)
