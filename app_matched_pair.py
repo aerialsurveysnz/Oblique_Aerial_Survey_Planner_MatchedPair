@@ -2225,9 +2225,10 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     else ctx.providers.OpenStreetMap.Mapnik
                 )
 
-                # Fetch tiles into a temporary figure so we can extract the
-                # raw pixel array and place it at exactly the right local coords.
-                # This avoids any coordinate transform ambiguity from contextily.
+                # Fetch tiles into a temporary figure.
+                # contextily snaps to tile boundaries so the image may be
+                # larger than the requested extent. We must read the ACTUAL
+                # extent it placed and convert that to local display coords.
                 _fig_tmp, _ax_tmp = plt.subplots(1, 1, figsize=(2, 2))
                 _ax_tmp.set_xlim(merc_w, merc_e)
                 _ax_tmp.set_ylim(merc_s, merc_n)
@@ -2239,22 +2240,25 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     attribution_size=1,
                 )
                 _tile_arr = None
+                _tile_extent = None
                 for _im in _ax_tmp.get_images():
                     _raw = _im.get_array()
                     if _raw is not None and _raw.ndim >= 2:
                         _tile_arr = _raw
+                        # get_extent() returns [left, right, bottom, top] in Mercator
+                        _tile_extent = _im.get_extent()
                         break
                 plt.close(_fig_tmp)
 
-                # Place tile pixels at local display coordinates.
-                # The tile covers merc_w..merc_e / merc_s..merc_n in Mercator.
-                # In local offset coords (subtract mx0/my0) that is x_lo..x_hi / y_lo..y_hi.
-                # In display units (divide by scale) that is x_lo/s .. x_hi/s.
-                if _tile_arr is not None:
+                if _tile_arr is not None and _tile_extent is not None:
+                    # Convert actual tile extent from Mercator to local display units
+                    _ext_x_lo = (_tile_extent[0] - mx0) / scale
+                    _ext_x_hi = (_tile_extent[1] - mx0) / scale
+                    _ext_y_lo = (_tile_extent[2] - my0) / scale
+                    _ext_y_hi = (_tile_extent[3] - my0) / scale
                     ax.imshow(
                         _tile_arr,
-                        extent=[x_lo / scale, x_hi / scale,
-                                y_lo / scale, y_hi / scale],
+                        extent=[_ext_x_lo, _ext_x_hi, _ext_y_lo, _ext_y_hi],
                         aspect="auto",
                         origin="upper",
                         alpha=0.65,
