@@ -2,7 +2,9 @@ streamlit
 matplotlib
 numpy
 pandas
+shapely
 openpyxl
 python-docx
 fpdf2
-shapely
+contextily
+pyproj
