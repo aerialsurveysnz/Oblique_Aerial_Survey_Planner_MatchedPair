@@ -684,9 +684,30 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
     section.orientation = WD_ORIENT.LANDSCAPE
     section.page_width, section.page_height = section.page_height, section.page_width
 
-    # Landscape A4: usable width ~9.5 in after margins.
-    # Images at 6.5 in leave ~3 in for heading + caption on same page.
-    IMG_W = Inches(6.5)
+    # Landscape A4: page height 8.27", margins ~1" each = ~6.27" usable height.
+    # Heading + caption + spacing takes ~0.7" → max image height = 5.5"
+    # Max width = 7.5" (generous for wide figures).
+    # Each image is fitted to stay within both limits, preserving aspect ratio.
+    MAX_W_IN = 7.5
+    MAX_H_IN = 5.0   # conservative to ensure heading fits on same page
+
+    def fit_image(img_bytes):
+        """Return (width, height) as Inches objects fitting within MAX_W x MAX_H."""
+        try:
+            from PIL import Image as PilImage
+            with PilImage.open(io.BytesIO(img_bytes)) as im:
+                px_w, px_h = im.size
+            aspect = px_w / px_h if px_h else 1.0
+            # Scale to fit width
+            w = MAX_W_IN
+            h = w / aspect
+            # If too tall, scale down by height instead
+            if h > MAX_H_IN:
+                h = MAX_H_IN
+                w = h * aspect
+            return Inches(w), Inches(h)
+        except Exception:
+            return Inches(6.5), None  # fallback width-only
 
     logo_path = find_report_logo()
     if logo_path is not None:
@@ -775,7 +796,8 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
             fig_p = doc.add_paragraph("Flight plan map")
             fig_p.paragraph_format.keep_with_next = True
             fig_p.paragraph_format.space_before = Pt(6)
-            doc.add_picture(io.BytesIO(mission_figure_bytes), width=IMG_W)
+            _w, _h = fit_image(mission_figure_bytes)
+            doc.add_picture(io.BytesIO(mission_figure_bytes), width=_w, height=_h)
 
     # ── 6-trigger multi-strip graphic ─────────────────────────────────────────
     if fig_ms_6trigger_bytes:
@@ -786,7 +808,8 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
             "Illustrates forward overlap, sidelap, and cross-track coverage band."
         )
         p6.paragraph_format.keep_with_next = True
-        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=IMG_W)
+        _w, _h = fit_image(fig_ms_6trigger_bytes)
+        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=_w, height=_h)
 
     # ── Coverage diagrams — each title keeps with its image ───────────────────
     if report_figures:
@@ -795,7 +818,8 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
             para = doc.add_paragraph(figure_title)
             para.paragraph_format.keep_with_next = True
             para.paragraph_format.space_before = Pt(4)
-            doc.add_picture(io.BytesIO(figure_bytes), width=IMG_W)
+            _w, _h = fit_image(figure_bytes)
+            doc.add_picture(io.BytesIO(figure_bytes), width=_w, height=_h)
 
     bio = io.BytesIO()
     doc.save(bio)
