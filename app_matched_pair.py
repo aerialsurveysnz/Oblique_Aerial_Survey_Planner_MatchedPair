@@ -684,6 +684,10 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
     section.orientation = WD_ORIENT.LANDSCAPE
     section.page_width, section.page_height = section.page_height, section.page_width
 
+    # Landscape A4: usable width ~9.5 in after margins.
+    # Images at 6.5 in leave ~3 in for heading + caption on same page.
+    IMG_W = Inches(6.5)
+
     logo_path = find_report_logo()
     if logo_path is not None:
         doc.add_picture(str(logo_path), width=Inches(2.3))
@@ -696,13 +700,13 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
     subtitle = doc.add_paragraph("Client summary of survey settings, coverage and camera geometry.")
     subtitle.runs[0].italic = True
 
+    # ── Settings + System summary — flow together, no forced page break ───────
     doc.add_heading("Summary of settings", level=2)
     table = doc.add_table(rows=1, cols=2)
     set_table_style(table, "Light List Accent 1")
     hdr = table.rows[0].cells
     hdr[0].text = "Item"
     hdr[1].text = "Value"
-
     for item, value in settings_rows:
         row = table.add_row().cells
         row[0].text = str(item)
@@ -719,55 +723,26 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
         row[0].text = str(item)
         row[1].text = str(value)
 
-    if mission_rows:
-        doc.add_heading("Sample area and flight plan", level=2)
-        mission_table = doc.add_table(rows=1, cols=2)
-        set_table_style(mission_table, "Light Grid Accent 1")
-        hdr_m = mission_table.rows[0].cells
-        hdr_m[0].text = "Metric"
-        hdr_m[1].text = "Value"
-        for item, value in mission_rows:
-            row = mission_table.add_row().cells
-            row[0].text = str(item)
-            row[1].text = str(value)
-        if mission_figure_bytes:
-            title_p = doc.add_paragraph("Sample area and generated flight lines")
-            title_p.paragraph_format.keep_with_next = True
-            title_p.paragraph_format.page_break_before = True
-            doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(9.0))
-
+    # ── Camera results — flows after system summary ───────────────────────────
     doc.add_heading("Camera results", level=2)
     table2 = doc.add_table(rows=1, cols=13)
     set_table_style(table2, "Medium Grid 1 Accent 1")
     hdr2 = table2.rows[0].cells
-    headers = [
-        "Camera",
-        "Inner edge oblique",
-        "Outer edge oblique",
-        "Near angle",
-        "Near class",
-        "Far angle",
-        "Far class",
-        "Inner GSD",
-        "Centre GSD",
-        "Outer GSD",
-        "Inner edge",
-        "Centre",
-        "Outer edge",
-    ]
-
-    for i, h in enumerate(headers):
+    for i, h in enumerate([
+        "Camera", "Inner oblique", "Outer oblique",
+        "Near angle", "Near class", "Far angle", "Far class",
+        "Inner GSD", "Centre GSD", "Outer GSD",
+        "Inner edge", "Centre", "Outer edge",
+    ]):
         hdr2[i].text = h
-
     for row_data in camera_rows:
         row = table2.add_row().cells
         for i, value in enumerate(row_data):
             row[i].text = str(value)
 
-    # ── Point coverage summary table ─────────────────────────────────────────
+    # ── Point coverage summary — flows after camera table ─────────────────────
     if coverage_summary_data:
-        h_cov = doc.add_heading("Point coverage summary", level=2)
-        h_cov.paragraph_format.page_break_before = True
+        doc.add_heading("Point coverage summary", level=2)
         cov_table = doc.add_table(rows=1, cols=3)
         set_table_style(cov_table, "Light Grid Accent 1")
         hdr_cov = cov_table.rows[0].cells
@@ -784,27 +759,43 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
             row_c[1].text = hits_val
             row_c[2].text = angles_val
 
+    # ── Mission area figure — page break so heading + image stay together ─────
+    if mission_rows:
+        doc.add_heading("Sample area and flight plan", level=2)
+        mission_table = doc.add_table(rows=1, cols=2)
+        set_table_style(mission_table, "Light Grid Accent 1")
+        hdr_m = mission_table.rows[0].cells
+        hdr_m[0].text = "Metric"
+        hdr_m[1].text = "Value"
+        for item, value in mission_rows:
+            row = mission_table.add_row().cells
+            row[0].text = str(item)
+            row[1].text = str(value)
+        if mission_figure_bytes:
+            fig_p = doc.add_paragraph("Flight plan map")
+            fig_p.paragraph_format.keep_with_next = True
+            fig_p.paragraph_format.space_before = Pt(6)
+            doc.add_picture(io.BytesIO(mission_figure_bytes), width=IMG_W)
+
     # ── 6-trigger multi-strip graphic ─────────────────────────────────────────
     if fig_ms_6trigger_bytes:
         h6 = doc.add_heading("Multi-strip coverage — 6 trigger instances", level=2)
-        h6.paragraph_format.page_break_before = True
         h6.paragraph_format.keep_with_next = True
         p6 = doc.add_paragraph(
-            "Three adjacent strips showing 6 successive trigger instances per strip. "
-            "Illustrates forward overlap, sidelap, and the matched-frame cross-track coverage band."
+            "Three adjacent strips showing 6 successive trigger instances. "
+            "Illustrates forward overlap, sidelap, and cross-track coverage band."
         )
         p6.paragraph_format.keep_with_next = True
-        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=Inches(9.0))
+        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=IMG_W)
 
-    # ── Coverage diagrams ─────────────────────────────────────────────────────
+    # ── Coverage diagrams — each title keeps with its image ───────────────────
     if report_figures:
-        h_diag = doc.add_heading("Coverage diagrams", level=2)
-        h_diag.paragraph_format.page_break_before = True
-        h_diag.paragraph_format.keep_with_next = True
+        doc.add_heading("Coverage diagrams", level=2)
         for figure_title, figure_bytes in report_figures:
             para = doc.add_paragraph(figure_title)
             para.paragraph_format.keep_with_next = True
-            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(9.0))
+            para.paragraph_format.space_before = Pt(4)
+            doc.add_picture(io.BytesIO(figure_bytes), width=IMG_W)
 
     bio = io.BytesIO()
     doc.save(bio)
