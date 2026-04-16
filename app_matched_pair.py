@@ -1928,7 +1928,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     if polygon is None or getattr(polygon, "is_empty", True):
         return None
 
-    fig, ax = dark_fig(4.2, 3.35)
+    fig, ax = dark_fig(6.5, 6.5)
     ax.set_aspect("equal")
 
     all_x = []
@@ -1956,7 +1956,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         x_mid = 0.5 * (x_min + x_max)
         y_mid = 0.5 * (y_min + y_max)
         half_span = 0.5 * max(x_span, y_span)
-        pad = max(half_span * 0.12, 1.0)
+        pad = max(half_span * 0.22, 1.0)  # 22% padding gives context around the AOI
         x_lo, x_hi = x_mid - half_span - pad, x_mid + half_span + pad
         y_lo, y_hi = y_mid - half_span - pad, y_mid + half_span + pad
     else:
@@ -1981,14 +1981,14 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ix, iy = interior.xy
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
-    _plot_poly(polygon)
+    _plot_poly(polygon, edgecolor="#58a6ff", facealpha=0.08, lw=1.5)
 
     for line in mission_outputs.get("mission_line_geometries", []):
         try:
             x, y = line.xy
         except Exception:
             continue
-        ax.plot(_sx(x), _sx(y), color="#f0c040", lw=1.5, alpha=0.95, zorder=4)
+        ax.plot(_sx(x), _sx(y), color="#f0c040", lw=1.0, alpha=0.85, zorder=4)
 
     ax.set_xlim(x_lo / scale, x_hi / scale)
     ax.set_ylim(y_lo / scale, y_hi / scale)
@@ -2053,9 +2053,10 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     ax,
                     crs="EPSG:3857",
                     source=tile_source,
-                    alpha=0.6,
+                    alpha=0.65,
                     zorder=1,
                     reset_extent=False,
+                    attribution_size=5,   # very small attribution text
                 )
 
                 # Restore our local display coordinate limits
@@ -2068,6 +2069,11 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     img.set_extent([x_lo / scale, x_hi / scale,
                                     y_lo / scale, y_hi / scale])
 
+                # Further shrink any attribution text that contextily added
+                for txt in ax.texts:
+                    txt.set_fontsize(5)
+                    txt.set_alpha(0.6)
+
             except ImportError:
                 _basemap_error = "contextily / pyproj not installed — reboot app to install packages."
             except Exception as _e:
@@ -2077,13 +2083,17 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
 
     # Axis labels and title — always applied, after basemap so they sit on top
     xt = ax.get_xticks()
-    ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
+    ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt],
+                        color="#8b949e", fontsize=8)
     yt = ax.get_yticks()
-    ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt], color="#8b949e")
-    ax.set_xlabel(f"Local easting ({axis_unit})", color="#8b949e")
-    ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e")
-    ax.set_title("AOI and generated flight lines", color="#c9d1d9", fontsize=11)
-    fig.tight_layout()
+    ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt],
+                        color="#8b949e", fontsize=8)
+    ax.set_xlabel(f"Local easting ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e", fontsize=9)
+    _aoi_name = mission_outputs.get("name", "AOI")
+    ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
+    ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
+    fig.tight_layout(pad=1.2)
     return fig, _basemap_error
 
 
