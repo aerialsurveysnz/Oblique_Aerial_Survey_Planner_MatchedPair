@@ -2019,28 +2019,28 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 import contextily as ctx
                 import pyproj
 
-                r = 6378137.0
-                cos_lat = math.cos(math.radians(lat0))
-
-                # Convert local-metre display limits back to lon/lat
-                def _local_m_to_lonlat(lx_m, ly_m):
-                    lon = math.degrees(lx_m / (r * cos_lat)) + lon0
-                    lat = math.degrees(ly_m / r) + lat0
-                    return lon, lat
-
-                # x_lo/x_hi/y_lo/y_hi are in metres (pre-scale)
-                ll_sw = _local_m_to_lonlat(x_lo, y_lo)
-                ll_ne = _local_m_to_lonlat(x_hi, y_hi)
-
-                # Project corners to Web Mercator
+                # Project the actual AOI lon/lat bounds to Web Mercator.
+                # Using the real geographic bounds (not back-converted from local
+                # metres) gives the correct tile fetch extent and image alignment.
                 transformer = pyproj.Transformer.from_crs(
                     "EPSG:4326", "EPSG:3857", always_xy=True
                 )
-                merc_w, merc_s = transformer.transform(ll_sw[0], ll_sw[1])
-                merc_e, merc_n = transformer.transform(ll_ne[0], ll_ne[1])
 
-                # Temporarily set axes to Web Mercator coords so contextily
-                # fetches the right tiles at the right zoom level
+                # Add the same proportional padding used for the display axes
+                # so the tile extent matches what is visible in the plot.
+                lon_span = lon_max - lon_min
+                lat_span = lat_max - lat_min
+                pad_frac = 0.22
+                lon_pad  = lon_span * pad_frac
+                lat_pad  = lat_span * pad_frac
+                merc_w, merc_s = transformer.transform(
+                    lon_min - lon_pad, lat_min - lat_pad
+                )
+                merc_e, merc_n = transformer.transform(
+                    lon_max + lon_pad, lat_max + lat_pad
+                )
+
+                # Set axes to Web Mercator so contextily fetches the right tiles
                 ax.set_xlim(merc_w, merc_e)
                 ax.set_ylim(merc_s, merc_n)
 
@@ -2056,20 +2056,19 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     alpha=0.65,
                     zorder=1,
                     reset_extent=False,
-                    attribution_size=5,   # very small attribution text
+                    attribution_size=5,
                 )
 
-                # Restore our local display coordinate limits
+                # Restore local display coordinate limits
                 ax.set_xlim(x_lo / scale, x_hi / scale)
                 ax.set_ylim(y_lo / scale, y_hi / scale)
 
-                # Re-scale the tile image extent to match local display coords.
-                # contextily places the image in Web Mercator units; rescale it.
+                # Rescale the tile image to fill the local display extent exactly
                 for img in ax.get_images():
                     img.set_extent([x_lo / scale, x_hi / scale,
                                     y_lo / scale, y_hi / scale])
 
-                # Further shrink any attribution text that contextily added
+                # Minimise attribution text size
                 for txt in ax.texts:
                     txt.set_fontsize(5)
                     txt.set_alpha(0.6)
