@@ -1993,11 +1993,15 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         pass
 
     # ── Basemap tile overlay ──
-    # Requires contextily and a geographic reference stored in the AOI payload.
-    # Falls back silently if contextily is not installed or the AOI has no geo ref.
+    # Uses contextily to add map tiles. The key insight: contextily's add_basemap
+    # works directly on the axes if we set the axes limits in Web Mercator (EPSG:3857)
+    # coordinates first, then restore our local display limits after.
+    #
+    # Returns a debug message that the caller can display if tiles fail.
+    _basemap_error = None
     if show_basemap:
-        lon0  = mission_outputs.get("lon0")
-        lat0  = mission_outputs.get("lat0")
+        lon0    = mission_outputs.get("lon0")
+        lat0    = mission_outputs.get("lat0")
         lon_min = mission_outputs.get("lon_min")
         lon_max = mission_outputs.get("lon_max")
         lat_min = mission_outputs.get("lat_min")
@@ -2007,74 +2011,63 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 import contextily as ctx
                 import pyproj
 
-                # Re-express the axes limits in Web Mercator (EPSG:3857)
-                # so contextily can fetch the right tiles.
-                transformer = pyproj.Transformer.from_crs(
-                    "EPSG:4326", "EPSG:3857", always_xy=True
-                )
-
-                # Convert local-metre axes limits back to lon/lat, then to Web Mercator
                 r = 6378137.0
                 cos_lat = math.cos(math.radians(lat0))
 
-                def local_to_lonlat(lx, ly):
-                    """Convert local-metre offset back to lon/lat."""
-                    lon = math.degrees(lx / (r * cos_lat)) + lon0
-                    lat = math.degrees(ly / r) + lat0
+                # Convert local-metre display limits back to lon/lat
+                def _local_m_to_lonlat(lx_m, ly_m):
+                    lon = math.degrees(lx_m / (r * cos_lat)) + lon0
+                    lat = math.degrees(ly_m / r) + lat0
                     return lon, lat
 
-                # Axes limits are already in display units (km or m).
-                # Convert back to metres for the local->lonlat transform.
-                lx_lo = x_lo; lx_hi = x_hi
-                ly_lo = y_lo; ly_hi = y_hi
+                # x_lo/x_hi/y_lo/y_hi are in metres (pre-scale)
+                ll_sw = _local_m_to_lonlat(x_lo, y_lo)
+                ll_ne = _local_m_to_lonlat(x_hi, y_hi)
 
-                ll_sw = local_to_lonlat(lx_lo, ly_lo)
-                ll_ne = local_to_lonlat(lx_hi, ly_hi)
+                # Project corners to Web Mercator
+                transformer = pyproj.Transformer.from_crs(
+                    "EPSG:4326", "EPSG:3857", always_xy=True
+                )
+                merc_w, merc_s = transformer.transform(ll_sw[0], ll_sw[1])
+                merc_e, merc_n = transformer.transform(ll_ne[0], ll_ne[1])
 
-                merc_sw = transformer.transform(ll_sw[0], ll_sw[1])
-                merc_ne = transformer.transform(ll_ne[0], ll_ne[1])
-
-                # Create a temporary axes in Web Mercator to let contextily
-                # fetch tiles, then blend the tile image onto our axes.
-                fig_tmp, ax_tmp = plt.subplots(1, 1, figsize=(1, 1))
-                ax_tmp.set_xlim(merc_sw[0], merc_ne[0])
-                ax_tmp.set_ylim(merc_sw[1], merc_ne[1])
+                # Temporarily set axes to Web Mercator coords so contextily
+                # fetches the right tiles at the right zoom level
+                ax.set_xlim(merc_w, merc_e)
+                ax.set_ylim(merc_s, merc_n)
 
                 tile_source = (
                     ctx.providers.Esri.WorldImagery
                     if basemap_style == "satellite"
                     else ctx.providers.OpenStreetMap.Mapnik
                 )
-                ctx.add_basemap(ax_tmp, source=tile_source, crs="EPSG:3857")
+                ctx.add_basemap(
+                    ax,
+                    crs="EPSG:3857",
+                    source=tile_source,
+                    alpha=0.6,
+                    zorder=1,
+                    reset_extent=False,
+                )
 
-                # Extract the tile image from the temporary axes
-                tile_img = None
-                for im in ax_tmp.get_images():
-                    tile_img = im
-                    break
-                plt.close(fig_tmp)
+                # Restore our local display coordinate limits
+                ax.set_xlim(x_lo / scale, x_hi / scale)
+                ax.set_ylim(y_lo / scale, y_hi / scale)
 
-                if tile_img is not None:
-                    # Get the tile image array and display it on our axes
-                    import numpy as np
-                    img_arr = tile_img.get_array()
-                    # Map the Web Mercator extent back to local display coordinates
-                    ax.imshow(
-                        img_arr,
-                        extent=[x_lo / scale, x_hi / scale, y_lo / scale, y_hi / scale],
-                        aspect="auto",
-                        origin="upper",
-                        alpha=0.55,
-                        zorder=1,
-                    )
-                    # Re-draw polygon and lines on top (zorder already set correctly)
-                    ax.set_xlim(x_lo / scale, x_hi / scale)
-                    ax.set_ylim(y_lo / scale, y_hi / scale)
+                # Re-scale the tile image extent to match local display coords.
+                # contextily places the image in Web Mercator units; rescale it.
+                for img in ax.get_images():
+                    img.set_extent([x_lo / scale, x_hi / scale,
+                                    y_lo / scale, y_hi / scale])
 
             except ImportError:
-                pass  # contextily not installed — silent fallback to no basemap
-            except Exception:
-                pass  # network error or other issue — silent fallback
+                _basemap_error = "contextily / pyproj not installed — reboot app to install packages."
+            except Exception as _e:
+                _basemap_error = f"Basemap tile fetch failed: {_e}"
+        else:
+            _basemap_error = "No geographic reference in AOI — basemap only works with KML files, not the standard example."
+
+    return fig, _basemap_error
 
     xt = ax.get_xticks()
     ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
@@ -2714,9 +2707,15 @@ else:
                     key="aoi_basemap_style",
                     format_func=lambda x: "OpenStreetMap" if x == "osm" else "Satellite (Esri)",
                 )
-        aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
-                                           show_basemap=_show_basemap,
-                                           basemap_style=_basemap_style)
+        _fig_result = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
+                                              show_basemap=_show_basemap,
+                                              basemap_style=_basemap_style)
+        if isinstance(_fig_result, tuple):
+            aoi_fig, _basemap_err = _fig_result
+        else:
+            aoi_fig, _basemap_err = _fig_result, None
+        if _basemap_err and _show_basemap:
+            st.caption(f"ℹ️ {_basemap_err}")
         if aoi_fig is not None:
             aoi_left, aoi_mid, aoi_right = st.columns([1.2, 2.6, 1.2])
             with aoi_mid:
