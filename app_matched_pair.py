@@ -593,7 +593,7 @@ def set_table_style(table, style_name):
         pass
 
 
-def fig_to_png_bytes(fig, dpi=180):
+def fig_to_png_bytes(fig, dpi=120):
     bio = io.BytesIO()
     fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
     bio.seek(0)
@@ -635,8 +635,9 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Average storage per image", f"{storage_per_image_mb:.1f} MB/image"],
         ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
+        ["Airborne time", f"{float(mission_outputs.get('airborne_time_s', 0.0)) / 3600.0:.2f} hr"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
-        ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr"],
+        ["Total flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr (airborne + turns)"],
     ]
 
 
@@ -2087,6 +2088,14 @@ def parse_kml_aoi(path):
     aoi_poly = unary_union(polygons)
     if aoi_poly.is_empty:
         raise RuntimeError("The KML geometry did not produce a usable AOI polygon.")
+    # Simplify for display — keeps rendering fast for large KML files.
+    # 1m tolerance preserves all visible detail at survey scales.
+    try:
+        _simp = aoi_poly.simplify(1.0, preserve_topology=True)
+        if not _simp.is_empty and _simp.is_valid:
+            aoi_poly = _simp
+    except Exception:
+        pass
 
     return {
         "name":     Path(path).stem,
@@ -2163,6 +2172,17 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     turn_time_per_line_s = max(float(turn_time_per_line_min), 0.0) * 60.0
 
     rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
+
+    # Simplify complex polygons before the intersection loop — this is the biggest
+    # speed win for large KML files with thousands of vertices.
+    # Tolerance = 1m preserves all meaningful geometry.
+    try:
+        simplified = rotated.simplify(1.0, preserve_topology=True)
+        if not simplified.is_empty and simplified.is_valid:
+            rotated = simplified
+    except Exception:
+        pass
+
     minx, miny, maxx, maxy = rotated.bounds
     width = maxx - minx
     if not np.isfinite(width) or width < 0:
@@ -2176,6 +2196,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     total_line_length_m = 0.0
     total_exposures = 0
     line_lengths_m = []
+    raw_segments = []   # store segments so we don't intersect twice
 
     for x in offsets:
         base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
@@ -2189,6 +2210,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
             total_line_length_m += mission_length
             line_lengths_m.append(mission_length)
             total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
+            raw_segments.append(seg)   # cache for geometry building below
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
@@ -2204,34 +2226,31 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     flight_time_s = airborne_time_s + total_turn_time_s if np.isfinite(airborne_time_s) else float("nan")
 
     mission_line_geometries = []
-    for x in offsets:
-        base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
-        intersection = rotated.intersection(base_line)
-        for seg in iter_line_geometries(intersection):
-            seg_length = float(seg.length)
-            if seg_length <= 0:
-                continue
-            coords = list(seg.coords)
-            if len(coords) < 2:
-                continue
-            start = coords[0]
-            end = coords[-1]
-            dy = end[1] - start[1]
-            seg_len = math.hypot(end[0] - start[0], dy)
-            if seg_len <= 0:
-                continue
-            extend = max(float(lead_in_out_m), 0.0)
-            ux = (end[0] - start[0]) / seg_len
-            uy = dy / seg_len
-            ext_start = (start[0] - ux * extend, start[1] - uy * extend)
-            ext_end = (end[0] + ux * extend, end[1] + uy * extend)
-            try:
-                ext_line = ShapelyLineString([ext_start, ext_end])
-                mission_line_geometries.append(
-                    shapely_rotate(ext_line, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
-                )
-            except Exception:
-                continue
+    for seg in raw_segments:
+        seg_length = float(seg.length)
+        if seg_length <= 0:
+            continue
+        coords = list(seg.coords)
+        if len(coords) < 2:
+            continue
+        start = coords[0]
+        end = coords[-1]
+        dy = end[1] - start[1]
+        seg_len = math.hypot(end[0] - start[0], dy)
+        if seg_len <= 0:
+            continue
+        extend = max(float(lead_in_out_m), 0.0)
+        ux = (end[0] - start[0]) / seg_len
+        uy = dy / seg_len
+        ext_start = (start[0] - ux * extend, start[1] - uy * extend)
+        ext_end = (end[0] + ux * extend, end[1] + uy * extend)
+        try:
+            ext_line = ShapelyLineString([ext_start, ext_end])
+            mission_line_geometries.append(
+                shapely_rotate(ext_line, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+            )
+        except Exception:
+            continue
 
     return {
         "name": aoi_payload.get("name", "AOI"),
