@@ -399,6 +399,44 @@ def _sync_scenarios_from_github():
             pass
 
 
+def _gh_delete_scenario(name):
+    """Delete a scenario from GitHub. Silent on failure."""
+    cfg = _gh_config()
+    if cfg is None:
+        return False
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request
+        filename = name if name.endswith(".json") else f"{name}.json"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}/{filename}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        }
+        # Get SHA first
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            sha = json.loads(resp.read()).get("sha")
+        payload = json.dumps({"message": f"Delete scenario: {filename}", "sha": sha, "branch": branch}).encode()
+        req = urllib.request.Request(api_url, data=payload, headers=headers, method="DELETE")
+        with urllib.request.urlopen(req):
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def delete_scenario(name):
+    """Delete a scenario locally and from GitHub."""
+    path = scenario_path_from_name(name)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _gh_delete_scenario(name)
+
+
 def load_scenario(path_or_name):
     candidate = Path(path_or_name)
     possible_paths = []
@@ -2648,7 +2686,12 @@ fwd_frac  = fwd_pct  / 100.0
 side_frac = side_pct / 100.0
 
 st.sidebar.markdown("---")
+_gh_configured = _gh_config() is not None
 st.sidebar.subheader("💾 Save / Load")
+if _gh_configured:
+    st.sidebar.caption("☁️ GitHub sync active — scenarios persist across reboots.")
+else:
+    st.sidebar.caption("⚠️ No GitHub sync — scenarios are lost on app reboot. Ask admin to configure GitHub secrets.")
 
 if "scenario_flash_message" in st.session_state:
     flash = st.session_state.pop("scenario_flash_message")
@@ -2657,17 +2700,20 @@ if "scenario_flash_message" in st.session_state:
 
 sc_name = st.sidebar.text_input("Scenario name", "my_survey")
 if st.sidebar.button("Save scenario"):
-    saved_path = save_scenario({
+    _sc_data = {
         "cameras": st.session_state.cameras,
         "altitude_m": altitude_m,
         "speed_ms": speed_ms,
         "fwd_overlap_pct": fwd_pct,
         "sidelap_pct": side_pct,
         "reciprocal": reciprocal,
-    }, sc_name)
+    }
+    saved_path = save_scenario(_sc_data, sc_name)
+    _gh_ok = _gh_config() is not None
+    _gh_msg = " and synced to GitHub ✓" if _gh_ok else " (local only — configure GitHub secrets to persist)"
     st.session_state.scenario_flash_message = {
-        "level": "success",
-        "text": f"Saved {saved_path.name} to {saved_path.parent.as_posix()}",
+        "level": "success" if _gh_ok else "warning",
+        "text": f"Saved {saved_path.name}{_gh_msg}",
     }
     st.session_state.selected_scenario_label = saved_path.name
     st.session_state.saved_scenario_selector = saved_path.name
@@ -2711,7 +2757,17 @@ if scenario_records:
         else:
             st.sidebar.error(f"Could not load '{load_name}'")
 
-    st.sidebar.caption("Selecting a saved scenario loads it automatically.")
+    _del_col1, _del_col2 = st.sidebar.columns([3, 1])
+    _del_col1.caption("Selecting a saved scenario loads it automatically.")
+    if _del_col2.button("🗑", help=f"Delete '{load_name}'", key="delete_scenario_btn"):
+        delete_scenario(load_name)
+        st.session_state.scenario_flash_message = {
+            "level": "success",
+            "text": f"Deleted {load_name}",
+        }
+        st.session_state.pop("selected_scenario_label", None)
+        st.session_state.saved_scenario_selector_prev = None
+        st.rerun()
 else:
     load_name = None
     st.sidebar.info("No saved scenarios found in saved_scenarios yet.")
