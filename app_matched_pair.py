@@ -2528,7 +2528,7 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, swath_m=None):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -2615,8 +2615,11 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
             if len(all_coords) < 2:
                 continue
             all_coords.sort(key=lambda c: c[1])
-            y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
-            y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
+            # Extend ends by lead-in + along-track reach, but cap at the
+            # buffered AOI bounding box so lines don't run far over water
+            _extend = max(float(lead_in_out_m), 0.0) + _max_along_reach
+            y_start = max(all_coords[0][1] - _extend, miny - max(float(lead_in_out_m), 0.0))
+            y_end   = min(all_coords[-1][1] + _extend, maxy + max(float(lead_in_out_m), 0.0))
             full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
             seg_length = float(full_seg.length)
             if seg_length <= 0:
@@ -2704,21 +2707,36 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         if SHAPELY_AVAILABLE and raw_segments and line_spacing_m > 0:
             # Use original polygon if available (pre-buffer), else use planning polygon
             _check_poly = (aoi_payload.get("original_polygon") or polygon)
-            half_w = line_spacing_m / 2.0
+            # Use actual swath width if provided, else fall back to line spacing
+            # Swath width > line spacing (that's how overlap works) so this gives
+            # accurate coverage including the oblique cameras' full across-track reach
+            _strip_half_w = (float(swath_m) / 2.0) if swath_m and float(swath_m) > line_spacing_m else (line_spacing_m / 2.0)
             strips = []
             for seg in raw_segments:
                 coords = list(seg.coords)
                 if len(coords) >= 2:
-                    strips.append(seg.buffer(half_w, cap_style=2))
+                    strips.append(seg.buffer(_strip_half_w, cap_style=2))
             if strips:
                 covered = unary_union(strips)
+                # Rotate back to original orientation
                 covered_orig = shapely_rotate(
                     covered, -float(flight_azimuth_deg),
                     origin=polygon.centroid, use_radians=False
                 )
-                intersection_area = _check_poly.intersection(covered_orig).area
-                if _check_poly.area > 0:
-                    coverage_pct = round(100.0 * intersection_area / _check_poly.area, 1)
+                # Use the original AOI polygon for coverage check
+                # Slightly shrink check polygon by 1m to avoid floating point edge issues
+                try:
+                    check_shrunk = _check_poly.buffer(-1.0)
+                    check_area = check_shrunk.area
+                    if check_area <= 0:
+                        check_shrunk = _check_poly
+                        check_area = _check_poly.area
+                except Exception:
+                    check_shrunk = _check_poly
+                    check_area = _check_poly.area
+                intersection_area = check_shrunk.intersection(covered_orig).area
+                if check_area > 0:
+                    coverage_pct = round(100.0 * intersection_area / check_area, 1)
     except Exception:
         coverage_pct = None
 
@@ -2763,7 +2781,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, swath_m=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -3599,6 +3617,7 @@ else:
                 help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage.",
             )
             aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
+            st.session_state["aoi_buffer_m_internal"] = aoi_buffer_m
         else:
             kml_files = list_library_kmls()
             if not kml_files:
@@ -3725,6 +3744,7 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
+                swath_m=getattr(mc, "combined_swath_m", None),
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
@@ -3739,6 +3759,7 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
+                swath_m=getattr(mc, "combined_swath_m", None),
             )
 
     # Store original unbuffered polygon for map overlay
