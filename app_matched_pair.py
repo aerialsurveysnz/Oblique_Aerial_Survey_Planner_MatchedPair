@@ -37,7 +37,6 @@ Run:
 """
 
 import json
-import base64
 import html
 import math
 from dataclasses import replace
@@ -301,326 +300,173 @@ def save_scenario(data, name):
     return path, gh_ok, gh_err
 
 
-def normalise_scenario_name(name):
-    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in str(name or "").strip())
-    cleaned = " ".join(cleaned.split())
-    return cleaned or "my_survey"
-
-
-def scenario_filename(name):
-    safe_name = normalise_scenario_name(name)
-    if not safe_name.lower().endswith(".json"):
-        safe_name = f"{safe_name}.json"
-    return safe_name
-
-
-def _read_secret(*path_parts):
-    """Read a secret from env vars or st.secrets with multiple fallback strategies."""
-    env_key = "_".join(str(part).upper() for part in path_parts if str(part).strip())
-    env_val = os.getenv(env_key)
-    if env_val not in (None, ""):
-        return str(env_val)
+def _gh_config():
+    """Return (token, repo, branch, folder) from st.secrets, or None if not set."""
     try:
-        current = st.secrets
-        for part in path_parts:
-            current = current[part]
-        if current not in (None, ""):
-            return str(current)
-    except Exception:
-        pass
-    try:
-        flat_key = ".".join(str(part) for part in path_parts if str(part).strip())
-        current = st.secrets.get(flat_key)
-        if current not in (None, ""):
-            return str(current)
+        sec = st.secrets.get("github", {})
+        token  = sec.get("token")
+        repo   = sec.get("repo")
+        branch = sec.get("branch", "main")
+        folder = sec.get("scenarios_folder", "saved_scenarios")
+        if token and repo:
+            return token, repo, branch, folder
     except Exception:
         pass
     return None
 
 
-def github_storage_config():
-    token = _read_secret("github", "token") or _read_secret("GITHUB_TOKEN")
-    repo  = _read_secret("github", "repo")  or _read_secret("GITHUB_REPO")
-    owner = _read_secret("github", "owner") or _read_secret("GITHUB_REPO_OWNER")
-    name  = _read_secret("github", "name")  or _read_secret("GITHUB_REPO_NAME")
-    branch        = (_read_secret("github", "branch")        or _read_secret("GITHUB_BRANCH")        or "main").strip()
-    scenario_path = (_read_secret("github", "scenarios_folder") or _read_secret("github", "scenario_path")
-                     or _read_secret("GITHUB_SCENARIO_PATH") or "saved_scenarios").strip(" /")
-
-    if repo and "/" in repo and (not owner or not name):
-        owner, name = repo.split("/", 1)
-
-    owner = (owner or "").strip()
-    name  = (name  or "").strip()
-    token = (token or "").strip()
-
-    return {
-        "token":         token,
-        "owner":         owner,
-        "name":          name,
-        "branch":        branch or "main",
-        "scenario_path": scenario_path or "saved_scenarios",
-        "enabled":       bool(token and owner and name),
-    }
-
-
-def _github_api_request(method, api_path, cfg=None, payload=None):
-    from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
-    cfg = cfg or github_storage_config()
-    url = f"https://api.github.com{api_path}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "oblique-survey-planner",
-    }
-    if cfg.get("token"):
-        headers["Authorization"] = f"Bearer {cfg['token']}"
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib_request.Request(url, data=data, headers=headers, method=method)
+def _gh_ensure_folder(token, repo, branch, folder, headers):
+    """Create folder on GitHub by pushing a .gitkeep file if it doesn't exist."""
+    import urllib.request, base64
+    gitkeep_url = f"https://api.github.com/repos/{repo}/contents/{folder}/.gitkeep"
     try:
-        with urllib_request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            if not raw:
-                return resp.status, None
-            return resp.status, json.loads(raw.decode("utf-8"))
-    except urllib_error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body) if body else {}
-        except Exception:
-            parsed = {"message": body}
-        parsed.setdefault("message", body or f"HTTP {exc.code}")
-        return exc.code, parsed
+        req = urllib.request.Request(gitkeep_url, headers=headers)
+        urllib.request.urlopen(req)  # already exists
+        return True
+    except Exception:
+        pass
+    try:
+        payload = json.dumps({
+            "message": "Create saved_scenarios folder",
+            "content": base64.b64encode(b"").decode(),
+            "branch": branch,
+        }).encode()
+        req = urllib.request.Request(gitkeep_url, data=payload, headers=headers, method="PUT")
+        urllib.request.urlopen(req)
+        return True
+    except Exception:
+        return False
 
 
-def _github_contents_path(name_or_relpath, cfg=None):
-    from urllib import parse as urllib_parse
-    cfg = cfg or github_storage_config()
-    rel = str(name_or_relpath or "").strip("/")
-    if rel.startswith(cfg["scenario_path"].strip("/") + "/"):
-        return rel
-    if "/" not in rel or rel.lower().endswith(".json"):
-        rel = scenario_filename(Path(rel).name)
-        rel = f"{cfg['scenario_path'].strip('/')}/{rel}"
-    return rel.strip("/")
-
-
-def _github_get_json_file(relpath, cfg=None):
-    from urllib import parse as urllib_parse
-    cfg = cfg or github_storage_config()
-    api_relpath = urllib_parse.quote(str(relpath).strip("/"), safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{api_relpath}?ref={urllib_parse.quote(cfg['branch'])}"
-    status, payload = _github_api_request("GET", api_path, cfg=cfg)
-    if status == 404:
-        return None
-    if status >= 300:
-        raise RuntimeError(payload.get("message", f"GitHub read failed ({status})"))
-    if isinstance(payload, dict) and payload.get("encoding") == "base64":
-        decoded = base64.b64decode(payload.get("content", "").encode("utf-8")).decode("utf-8")
-        data = json.loads(decoded)
-        return {
-            "data": data,
-            "sha":  payload.get("sha"),
-            "path": payload.get("path", relpath),
-            "name": payload.get("name", Path(relpath).name),
+def _gh_push_scenario(name, json_text):
+    """Push a scenario JSON file to GitHub. Returns (True, None) on success or (False, error_msg)."""
+    cfg = _gh_config()
+    if cfg is None:
+        return False, "GitHub not configured"
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request, base64
+        filename = name if name.endswith(".json") else f"{name}.json"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}/{filename}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
         }
-    raise RuntimeError("Unexpected response while reading the scenario from GitHub.")
-
-
-def save_scenario_local(data, name):
-    path = scenario_path_from_name(name)
-    path.write_text(json.dumps(data, indent=2, default=str))
-    return path
-
-
-def save_scenario_github(data, name):
-    from urllib import parse as urllib_parse
-    cfg = github_storage_config()
-    if not cfg["enabled"]:
-        raise RuntimeError("GitHub storage not configured.")
-    relpath  = _github_contents_path(name, cfg=cfg)
-    existing = _github_get_json_file(relpath, cfg=cfg)
-    encoded  = base64.b64encode(json.dumps(data, indent=2, default=str).encode("utf-8")).decode("utf-8")
-    api_relpath = urllib_parse.quote(relpath, safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{api_relpath}"
-    body = {
-        "message": f"Save scenario {Path(relpath).name}",
-        "content": encoded,
-        "branch":  cfg["branch"],
-    }
-    if existing and existing.get("sha"):
-        body["sha"] = existing["sha"]
-    status, response = _github_api_request("PUT", api_path, cfg=cfg, payload=body)
-    if status >= 300:
-        raise RuntimeError((response or {}).get("message", f"GitHub save failed ({status})"))
-    content = (response or {}).get("content") or {}
-    return {
-        "label":    content.get("name", Path(relpath).name),
-        "path":     f"github:{relpath}",
-        "origin":   "github",
-        "saved_to": f"{cfg['owner']}/{cfg['name']}:{relpath}",
-        "branch":   cfg["branch"],
-    }
-
-
-def save_scenario(data, name):
-    """Save locally and to GitHub. Returns (record_dict, gh_ok, gh_err)."""
-    local_path = save_scenario_local(data, name)
-    cfg = github_storage_config()
-    if cfg["enabled"]:
+        sha = None
+        req = urllib.request.Request(api_url, headers=headers)
         try:
-            record = save_scenario_github(data, name)
-            record["local_backup"] = str(local_path)
-            return record, True, None
-        except Exception as exc:
-            return {"label": local_path.name, "path": str(local_path), "origin": "saved_scenarios"}, False, str(exc)
-    return {"label": local_path.name, "path": str(local_path), "origin": "saved_scenarios"}, False, None
-
-
-def load_scenario(path_or_name):
-    raw = str(path_or_name or "")
-    if raw.startswith("github:"):
-        relpath = raw.split(":", 1)[1]
-        try:
-            file_obj = _github_get_json_file(relpath)
-            data = (file_obj or {}).get("data")
-            if is_scenario_payload(data):
-                return data
+            with urllib.request.urlopen(req) as resp:
+                sha = json.loads(resp.read()).get("sha")
         except Exception:
             pass
-        return None
-    # Try local first
-    candidate = Path(path_or_name)
-    for p in [candidate, scenario_path_from_name(path_or_name),
-              Path(candidate.name), Path(f"{candidate.name}.json")]:
+        payload = {
+            "message": f"Save scenario: {filename}",
+            "content": base64.b64encode(json_text.encode()).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
         try:
-            d = json.loads(p.read_text())
-            if is_scenario_payload(d):
-                return d
-        except Exception:
-            continue
-    # Fall back to GitHub
-    cfg = github_storage_config()
-    if cfg["enabled"]:
-        try:
-            relpath  = _github_contents_path(path_or_name, cfg=cfg)
-            file_obj = _github_get_json_file(relpath, cfg=cfg)
-            data = (file_obj or {}).get("data")
-            if is_scenario_payload(data):
-                return data
-        except Exception:
-            pass
-    return None
+            with urllib.request.urlopen(req) as resp:
+                status = resp.status
+                if status not in (200, 201):
+                    return False, f"GitHub returned HTTP {status}"
+                return True, None
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Folder probably doesn't exist — create it and retry
+                if _gh_ensure_folder(token, repo, branch, folder, headers):
+                    req2 = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+                    try:
+                        with urllib.request.urlopen(req2) as resp2:
+                            if resp2.status in (200, 201):
+                                return True, None
+                    except Exception as e2:
+                        return False, f"After folder create: {e2}"
+            body = e.read().decode("utf-8", errors="replace")[:200]
+            return False, f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
-def list_saved_scenarios_github():
-    from urllib import parse as urllib_parse
-    cfg = github_storage_config()
-    if not cfg["enabled"]:
+def _gh_list_scenarios():
+    """List scenario files from GitHub using contents API.
+    Returns list of (name, json_text). Each file fetched via its download_url.
+    Returns [] on any failure.
+    """
+    cfg = _gh_config()
+    if cfg is None:
         return []
-    relpath  = urllib_parse.quote(cfg["scenario_path"], safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{relpath}?ref={urllib_parse.quote(cfg['branch'])}"
-    status, payload = _github_api_request("GET", api_path, cfg=cfg)
-    if status == 404:
-        return []
-    if status >= 300:
-        raise RuntimeError(payload.get("message", f"GitHub list failed ({status})"))
-    found = []
-    for item in payload or []:
-        if item.get("type") != "file":
-            continue
-        iname = str(item.get("name", ""))
-        if not iname.lower().endswith(".json"):
-            continue
-        found.append({
-            "label":    iname,
-            "path":     f"github:{item.get('path', '')}",
-            "origin":   "github",
-            "saved_to": f"{cfg['owner']}/{cfg['name']}:{item.get('path', '')}",
-        })
-    return sorted(found, key=lambda x: x["label"].lower())
-
-
-def list_saved_scenarios_local():
-    ensure_scenario_dir()
-    found = []
-    seen  = set()
-    def _append(path, origin):
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            return
-        if not is_scenario_payload(data):
-            return
-        resolved = str(path.resolve())
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        label = path.name if origin == "saved_scenarios" else f"{path.name} (project root)"
-        found.append({"label": label, "path": str(path), "origin": origin})
-    for path in sorted(SCENARIO_DIR.glob("*.json"), key=lambda p: p.name.lower()):
-        _append(path, "saved_scenarios")
-    for path in sorted(_APP_DIR.glob("*.json"), key=lambda p: p.name.lower()):
-        if path.name == PRESET_FILE.name:
-            continue
-        _append(path, "project_root")
-    return found
-
-
-def list_saved_scenarios():
-    found = []
-    seen_labels = set()
+    token, repo, branch, folder = cfg
     try:
-        for record in list_saved_scenarios_github():
-            key = record["label"].lower()
-            if key in seen_labels:
+        import urllib.request
+        # Get directory listing
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            items = json.loads(resp.read())
+        if not isinstance(items, list):
+            return []
+        results = []
+        for item in items:
+            if not item.get("name", "").endswith(".json"):
                 continue
-            seen_labels.add(key)
-            found.append(record)
-    except Exception as exc:
-        st.sidebar.warning(f"GitHub scenario list unavailable: {exc}")
-    for record in list_saved_scenarios_local():
-        key = record["label"].replace(" (project root)", "").lower()
-        if key in seen_labels and record.get("origin") != "project_root":
-            continue
-        seen_labels.add(key)
-        found.append(record)
-    return found
-
-
-def delete_scenario(name):
-    """Delete a scenario locally and from GitHub."""
-    from urllib import parse as urllib_parse
-    # Local delete
-    path = scenario_path_from_name(name)
-    try:
-        path.unlink(missing_ok=True)
+            # Use raw_url (unauthenticated) or download_url — faster than API
+            dl_url = item.get("download_url") or item.get("html_url")
+            if not dl_url:
+                continue
+            try:
+                req2 = urllib.request.Request(
+                    dl_url,
+                    headers={"Authorization": f"token {token}"}
+                )
+                with urllib.request.urlopen(req2, timeout=10) as r:
+                    results.append((item["name"], r.read().decode("utf-8")))
+            except Exception:
+                continue  # skip individual file failures, keep going
+        return results
     except Exception:
-        pass
-    # GitHub delete
-    cfg = github_storage_config()
-    if not cfg["enabled"]:
+        return []
+
+
+def _sync_scenarios_from_github():
+    """Pull ALL scenario files from GitHub into local SCENARIO_DIR.
+    Called once per session on startup. Stores sync result in session state
+    so the sidebar can show whether sync succeeded.
+    """
+    cfg = _gh_config()
+    if cfg is None:
+        st.session_state["gh_sync_result"] = "not_configured"
         return
-    try:
-        relpath  = _github_contents_path(name, cfg=cfg)
-        file_obj = _github_get_json_file(relpath, cfg=cfg)
-        if not file_obj:
-            return
-        sha      = file_obj.get("sha")
-        api_relpath = urllib_parse.quote(relpath, safe="/")
-        api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{api_relpath}"
-        body = {"message": f"Delete scenario {Path(relpath).name}", "sha": sha, "branch": cfg["branch"]}
-        _github_api_request("DELETE", api_path, cfg=cfg, payload=body)
-    except Exception:
-        pass
+    ensure_scenario_dir()
+    synced = 0
+    failed = 0
+    for filename, json_text in _gh_list_scenarios():
+        local_path = SCENARIO_DIR / filename
+        try:
+            data = json.loads(json_text)
+            if is_scenario_payload(data):
+                local_path.write_text(json_text, encoding="utf-8")
+                synced += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    st.session_state["gh_sync_result"] = f"ok:{synced}"
+    if failed:
+        st.session_state["gh_sync_result"] += f":failed:{failed}"
 
 
 def _gh_delete_scenario(name):
     """Delete a scenario from GitHub. Silent on failure."""
-    cfg = github_storage_config()
+    cfg = _gh_config()
     if cfg is None:
         return False
     token, repo, branch, folder = cfg
@@ -880,7 +726,6 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["AOI area", f"{area_km2:.1f} km²"],
         ["Flight azimuth", f"{float(mission_outputs.get('flight_azimuth_deg', 0.0)):.1f}°"],
         ["Lead-in / out per line", f"{m_to_unit(float(mission_outputs.get('lead_in_out_m', 0.0)), dist_unit):.0f} {dist_unit}"],
-        ["Line end extension", f"{m_to_unit(float(mission_outputs.get('line_end_extension_m', 0.0)), dist_unit):.0f} {dist_unit}" if mission_outputs.get('line_end_extension_m', 0.0) > 0 else "None"],
         ["Flight lines", int(mission_outputs.get("line_count", 0))],
         ["Trigger events", int(mission_outputs.get("trigger_events", 0))],
         ["Frames per camera", int(mission_outputs.get("frames_per_camera", 0))],
@@ -1124,7 +969,7 @@ def make_kml_export(mission_outputs, solutions=None):
         _buf_label = f"4b. Flight Planning Boundary (+{buf_m:.0f} m buffer)" if buf_m > 0 else "4b. Flight Planning Boundary (no buffer)"
         _buf_desc  = (f"AOI expanded by {buf_m:.0f} m coverage buffer — flight lines cover this area"
                       if buf_m > 0 else "No buffer applied")
-        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ffff4400</color><width>2.5</width></LineStyle><PolyStyle><color>10ff4400</color></PolyStyle></Style>')
+        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ffffa658</color><width>2.5</width></LineStyle><PolyStyle><color>10ffa658</color></PolyStyle></Style>')
         bgeoms = ([buffered_poly] if getattr(buffered_poly,"geom_type","") == "Polygon"
                   else list(getattr(buffered_poly,"geoms",[])))
         ed_buf = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{_buf_label}</SimpleData></SchemaData></ExtendedData>'
@@ -1434,11 +1279,9 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 # Sync scenarios from GitHub once per session (persists across Cloud reboots)
 # Always sync from GitHub at session start — ensures scenarios survive reboots
 # Session state resets on reboot so this runs fresh each time
-# GitHub scenarios are listed live via list_saved_scenarios_github()
-# No startup sync needed — scenarios load on demand
 if "gh_scenarios_synced" not in st.session_state:
+    _sync_scenarios_from_github()
     st.session_state.gh_scenarios_synced = True
-    st.session_state["gh_sync_result"] = "ok:live"
 
 if "cameras" not in st.session_state:
     st.session_state.cameras = [dict(c) for c in DEFAULT_CAMERAS]
@@ -2685,7 +2528,7 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, line_end_extension_m=0.0):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -2772,9 +2615,8 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
             if len(all_coords) < 2:
                 continue
             all_coords.sort(key=lambda c: c[1])
-            _end_ext = max(float(lead_in_out_m), 0.0) + _max_along_reach + max(float(line_end_extension_m), 0.0)
-            y_start = all_coords[0][1] - _end_ext
-            y_end   = all_coords[-1][1] + _end_ext
+            y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
+            y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
             full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
             seg_length = float(full_seg.length)
             if seg_length <= 0:
@@ -2855,7 +2697,6 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "flight_time_s": float(flight_time_s),
         "flight_azimuth_deg": float(flight_azimuth_deg),
         "lead_in_out_m": float(lead_in_out_m),
-        "line_end_extension_m": float(line_end_extension_m),
         "mission_line_geometries": mission_line_geometries,
         "aoi_polygon": polygon,        # buffered polygon used for flight line generation
         "original_aoi_polygon": (aoi_payload.get("original_polygon")  # original pre-buffer
@@ -2874,7 +2715,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, line_end_extension_m=0.0):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -3249,7 +3090,7 @@ fwd_frac  = fwd_pct  / 100.0
 side_frac = side_pct / 100.0
 
 st.sidebar.markdown("---")
-_gh_configured = github_storage_config()["enabled"]
+_gh_configured = _gh_config() is not None
 st.sidebar.subheader("💾 Save / Load")
 if _gh_configured:
     _sync_result = st.session_state.get("gh_sync_result", "not_run")
@@ -3267,9 +3108,9 @@ if _gh_configured:
 
     # Debug expander — shows exactly what happened
     with st.sidebar.expander("🔍 Sync diagnostics"):
-        cfg = github_storage_config()
-        if cfg and cfg.get("enabled"):
-            token, repo, branch, folder = cfg.get("token",""), f"{cfg.get('owner','')}/{cfg.get('name','')}", cfg.get("branch",""), cfg.get("scenario_path","")
+        cfg = _gh_config()
+        if cfg:
+            token, repo, branch, folder = cfg
             st.write(f"**Repo:** {repo}")
             st.write(f"**Branch:** {branch}")
             st.write(f"**Folder:** {folder}")
@@ -3787,18 +3628,6 @@ else:
             key="aoi_lead_in_out_display",
         )
         lead_in_out_m = unit_to_m(lead_in_out_display, dist_unit)
-        _ext_display = st.number_input(
-            f"Line end extension ({dist_unit})",
-            min_value=0.0,
-            max_value=m_to_unit(10000.0, dist_unit),
-            value=0.0,
-            step=max(1.0, m_to_unit(100.0, dist_unit)),
-            key="aoi_line_end_extension_display",
-            help="Extends each flight line beyond the AOI boundary at both ends. "
-                 "Use this to ensure fore/aft oblique footprints fully cover the AOI edge. "
-                 "0 = no extra extension beyond the automatic footprint reach.",
-        )
-        line_end_extension_m = unit_to_m(_ext_display, dist_unit)
         turn_time_per_line_min = st.number_input(
             "Turn time between runs (min)",
             min_value=0.0,
@@ -3848,7 +3677,6 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
-                line_end_extension_m=line_end_extension_m,
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
@@ -3863,7 +3691,6 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
-                line_end_extension_m=line_end_extension_m,
             )
 
     # Store original unbuffered polygon for map overlay
