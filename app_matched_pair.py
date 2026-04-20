@@ -738,19 +738,17 @@ def make_kml_export(mission_outputs, solutions=None):
     def _cs(pts):
         return " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in pts)
 
-    def _poly_pm(style_id, corners):
+    def _poly_pm(style_id, corners, folder=''):
         """Return a KML Placemark string for a polygon (corners in local offsets)."""
         cl = corners + [corners[0]]
         cs = " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in cl)
-        return (f'    <Placemark><styleUrl>#{style_id}</styleUrl>'
-                f'<Polygon><tessellate>1</tessellate>'
-                f'<outerBoundaryIs><LinearRing><coordinates>{cs}</coordinates>'
-                f'</LinearRing></outerBoundaryIs></Polygon></Placemark>')
+        ed = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{folder}</SimpleData></SchemaData></ExtendedData>' if folder else ''
+        return f'    <Placemark><styleUrl>#{style_id}</styleUrl>' + ed + f'<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{cs}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
 
-    def _pt_pm(style_id, lx, ly):
+    def _pt_pm(style_id, lx, ly, folder=''):
         lo, la = _wgs84(lx, ly)
-        return (f'    <Placemark><styleUrl>#{style_id}</styleUrl>'
-                f'<Point><coordinates>{lo:.8f},{la:.8f},0</coordinates></Point></Placemark>')
+        ed = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{folder}</SimpleData></SchemaData></ExtendedData>' if folder else ''
+        return f'    <Placemark><styleUrl>#{style_id}</styleUrl>' + ed + f'<Point><coordinates>{lo:.8f},{la:.8f},0</coordinates></Point></Placemark>'
 
     name       = mission_outputs.get("name", "AOI")
     azimuth    = float(mission_outputs.get("flight_azimuth_deg", 0.0))
@@ -830,7 +828,7 @@ def make_kml_export(mission_outputs, solutions=None):
                 cs = _cs(coords)
                 sty = "fl_odd" if idx % 2 == 1 else "fl_even"
                 out.append(f'''    <Placemark><name>Line {idx}</name><styleUrl>#{sty}</styleUrl>
-      <LineString><tessellate>1</tessellate><coordinates>{cs}</coordinates></LineString>
+      <ExtendedData><SchemaData><SimpleData name="KML_FOLDER">1. Flight Lines</SimpleData></SchemaData></ExtendedData><LineString><tessellate>1</tessellate><coordinates>{cs}</coordinates></LineString>
     </Placemark>''')
             except Exception:
                 continue
@@ -866,7 +864,7 @@ def make_kml_export(mission_outputs, solutions=None):
         # Combined (all cameras) — always visible
         out.append('''    <Folder><name>All cameras combined</name><visibility>1</visibility>''')
         for cx,cy,*_ in trigger_positions:
-            out.append(_pt_pm("pt_all", cx, cy))
+            out.append(_pt_pm("pt_all", cx, cy, "2. Trigger Points"))
         out.append('''    </Folder>''')
 
         # Per-camera sub-folders — collapsed by default
@@ -893,7 +891,7 @@ def make_kml_export(mission_outputs, solutions=None):
                 try:
                     rot = [(cx + fcx*ax + fcy*ux, cy + fcx*ay + fcy*uy)
                            for fcx,fcy in corners]
-                    out.append(_poly_pm("fp_all", rot))
+                    out.append(_poly_pm("fp_all", rot, "3. Frame Coverage"))
                 except Exception:
                     continue
         out.append('''    </Folder>''')
@@ -914,44 +912,39 @@ def make_kml_export(mission_outputs, solutions=None):
         out.append('''  </Folder>''')
 
     # ── 4. AOI BOUNDARY ───────────────────────────────────────────────────────
+    # ── 4. AOI BOUNDARY (original, unbuffered) ────────────────────────────────
     if aoi_poly is not None and not getattr(aoi_poly, "is_empty", True):
-        out.append('''  <Folder>
-    <name>4. AOI Boundary</name>
-    <visibility>1</visibility>''')
+        out.append('  <Folder>\n    <n>4. AOI Boundary</n>\n    <visibility>1</visibility>\n    <description>Original AOI boundary as loaded from KML</description>')
         geoms = ([aoi_poly] if getattr(aoi_poly,"geom_type","") == "Polygon"
                  else list(getattr(aoi_poly,"geoms",[])))
+        ed_aoi = '<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">4. AOI Boundary</SimpleData></SchemaData></ExtendedData>'
         for geom in geoms:
             if getattr(geom,"is_empty",True): continue
             outer_str = _cs(list(geom.exterior.coords))
-            pm = f'''    <Placemark><name>AOI</name><styleUrl>#aoi</styleUrl>
-      <Polygon><tessellate>1</tessellate>
-        <outerBoundaryIs><LinearRing><coordinates>{outer_str}</coordinates></LinearRing></outerBoundaryIs>'''
+            pm = f'    <Placemark><n>AOI Boundary</n><styleUrl>#aoi</styleUrl>{ed_aoi}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{outer_str}</coordinates></LinearRing></outerBoundaryIs>'
             for interior in getattr(geom,"interiors",[]):
                 istr = _cs(list(interior.coords))
-                pm += f'''\n        <innerBoundaryIs><LinearRing><coordinates>{istr}</coordinates></LinearRing></innerBoundaryIs>'''
-            pm += '''\n      </Polygon>\n    </Placemark>'''
+                pm += f'<innerBoundaryIs><LinearRing><coordinates>{istr}</coordinates></LinearRing></innerBoundaryIs>'
+            pm += '</Polygon></Placemark>'
             out.append(pm)
-        out.append('''  </Folder>''')
+        out.append('  </Folder>')
 
-    # ── 4b. BUFFERED AOI (flight planning boundary) ──────────────────────────
+    # ── 4b. FLIGHT PLANNING BOUNDARY (buffered AOI) ────────────────────────────
+    # Always exported — if no buffer it equals the AOI boundary
     buffered_poly = mission_outputs.get("aoi_polygon")
-    if buf_m > 0 and buffered_poly is not None and not getattr(buffered_poly,"is_empty",True):
-        out.append('''  <Folder>
-    <n>4b. Flight Planning Boundary (buffered)</n>
-    <visibility>1</visibility>
-    <description>AOI expanded by coverage buffer — flight lines cover this area</description>
-  <Style id="buf"><LineStyle><color>ff44ffff</color><width>2</width></LineStyle><PolyStyle><color>0844ffff</color></PolyStyle></Style>''')
+    if buffered_poly is not None and not getattr(buffered_poly,"is_empty",True):
+        _buf_label = f"4b. Flight Planning Boundary (+{buf_m:.0f} m buffer)" if buf_m > 0 else "4b. Flight Planning Boundary (no buffer)"
+        _buf_desc  = (f"AOI expanded by {buf_m:.0f} m coverage buffer — flight lines cover this area"
+                      if buf_m > 0 else "No buffer applied")
+        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ff44ffff</color><width>2.5</width></LineStyle><PolyStyle><color>1044ffff</color></PolyStyle></Style>')
         bgeoms = ([buffered_poly] if getattr(buffered_poly,"geom_type","") == "Polygon"
                   else list(getattr(buffered_poly,"geoms",[])))
+        ed_buf = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{_buf_label}</SimpleData></SchemaData></ExtendedData>'
         for bgeom in bgeoms:
             if getattr(bgeom,"is_empty",True): continue
             bouter = _cs(list(bgeom.exterior.coords))
-            out.append(f'''    <Placemark><n>Buffered AOI (+{buf_m:.0f} m)</n><styleUrl>#buf</styleUrl>
-      <Polygon><tessellate>1</tessellate>
-        <outerBoundaryIs><LinearRing><coordinates>{bouter}</coordinates></LinearRing></outerBoundaryIs>
-      </Polygon>
-    </Placemark>''')
-        out.append('''  </Folder>''')
+            out.append(f'    <Placemark><n>{_buf_label}</n><styleUrl>#buf</styleUrl>{ed_buf}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{bouter}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>')
+        out.append('  </Folder>')
 
     out.append('''</Document>
 </kml>''')
@@ -2501,7 +2494,7 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -2535,6 +2528,9 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     # Keep only those within the AOI bounds (plus one line width margin)
     offsets = [x for x in offsets if x <= maxx + line_spacing_m]
     pad = max(maxy - miny, 1.0) + max(float(lead_in_out_m), 0.0) + 1000.0
+    # Along-track extension: ensures fore/aft footprints reach the AOI boundary.
+    # Use actual camera along-track reach if provided, else photo_spacing proxy.
+    _max_along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
 
     line_count = 0
     total_line_length_m = 0.0
@@ -2542,19 +2538,42 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     line_lengths_m = []
     raw_segments = []   # store segments so we don't intersect twice
 
+    # Flight lines run the full bounding-box height without clipping to the
+    # AOI polygon. This ensures complete coverage along irregular coastlines
+    # and concave boundaries — the buffer zone is automatically included.
+    # We only generate a line if it intersects the AOI (to avoid lines far
+    # outside the area), but the line itself is not clipped.
     for x in offsets:
         base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
+        # Check if this x position intersects the AOI at all
+        if not rotated.intersects(base_line):
+            continue
+        # Get the intersection to determine the actual extent of the line
+        # within the AOI — used for start/end points only
         intersection = rotated.intersection(base_line)
-        for seg in iter_line_geometries(intersection):
-            seg_length = float(seg.length)
-            if seg_length <= 0:
-                continue
-            mission_length = seg_length + 2.0 * max(float(lead_in_out_m), 0.0)
-            line_count += 1
-            total_line_length_m += mission_length
-            line_lengths_m.append(mission_length)
-            total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
-            raw_segments.append(seg)   # cache for geometry building below
+        segs = list(iter_line_geometries(intersection))
+        if not segs:
+            continue
+        all_coords = []
+        for seg in segs:
+            all_coords.extend(list(seg.coords))
+        if len(all_coords) < 2:
+            continue
+        all_coords.sort(key=lambda c: c[1])
+        # Extend line ends by lead-in PLUS the max along-track footprint reach
+        # so that fore/aft oblique footprints always cover the AOI boundary
+        y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
+        y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
+        full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
+        seg_length = float(full_seg.length)
+        if seg_length <= 0:
+            continue
+        mission_length = seg_length
+        line_count += 1
+        total_line_length_m += mission_length
+        line_lengths_m.append(mission_length)
+        total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
+        raw_segments.append(full_seg)   # full unclipped segment
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
@@ -2571,27 +2590,10 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
 
     mission_line_geometries = []
     for seg in raw_segments:
-        seg_length = float(seg.length)
-        if seg_length <= 0:
-            continue
-        coords = list(seg.coords)
-        if len(coords) < 2:
-            continue
-        start = coords[0]
-        end = coords[-1]
-        dy = end[1] - start[1]
-        seg_len = math.hypot(end[0] - start[0], dy)
-        if seg_len <= 0:
-            continue
-        extend = max(float(lead_in_out_m), 0.0)
-        ux = (end[0] - start[0]) / seg_len
-        uy = dy / seg_len
-        ext_start = (start[0] - ux * extend, start[1] - uy * extend)
-        ext_end = (end[0] + ux * extend, end[1] + uy * extend)
+        # Segments already include lead-in/out — just rotate back to original coords
         try:
-            ext_line = ShapelyLineString([ext_start, ext_end])
             mission_line_geometries.append(
-                shapely_rotate(ext_line, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+                shapely_rotate(seg, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
             )
         except Exception:
             continue
@@ -2659,7 +2661,7 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -3529,9 +3531,21 @@ else:
 
     if aoi_payload is not None:
         # Apply coverage buffer — expand AOI before flight line generation
-        _aoi_buffer_m = st.session_state.get("aoi_buffer_display", 500.0)
-        _aoi_buffer_m = unit_to_m(float(_aoi_buffer_m), dist_unit)
+        _aoi_buffer_m = float(st.session_state.get("aoi_buffer_m_internal", 500.0))
         _aoi_for_planning = build_buffered_aoi(aoi_payload, _aoi_buffer_m)
+
+        # Compute actual along-track footprint reach from camera solutions
+        _along_reach = 0.0
+        for _cam_s, _sol_s, _ in solutions:
+            try:
+                _fp = camera_polygon(_sol_s)
+                if _fp:
+                    _along_reach = max(_along_reach,
+                                       max(abs(c[1]) for c in _fp if math.isfinite(c[1])))
+            except Exception:
+                pass
+        if _along_reach <= 0:
+            _along_reach = mc.recommended_photo_spacing_m * 1.5
 
         if optimize_flight_direction:
             mission_outputs = optimize_aoi_flight_direction(
@@ -3545,6 +3559,7 @@ else:
                 search_step_deg=search_step_deg,
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
+                along_track_reach_m=_along_reach,
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
@@ -3558,6 +3573,7 @@ else:
                 turn_time_per_line_min=turn_time_per_line_min,
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
+                along_track_reach_m=_along_reach,
             )
 
     # Store original unbuffered polygon for map overlay
