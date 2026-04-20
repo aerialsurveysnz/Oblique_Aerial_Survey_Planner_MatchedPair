@@ -2566,6 +2566,23 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     # Use actual camera along-track reach if provided, else photo_spacing proxy.
     _max_along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
 
+    # Pre-compute original AOI bounds in rotated frame for line end clamping.
+    # Use the original polygon's own centroid as rotation origin for accuracy.
+    try:
+        _orig_poly = aoi_payload.get("original_polygon") or polygon
+        _orig_rot = shapely_rotate(
+            _orig_poly, float(flight_azimuth_deg), origin=_orig_poly.centroid, use_radians=False
+        )
+        _ob = _orig_rot.bounds  # (minx, miny, maxx, maxy)
+        # The rotated bounds may be in a different coordinate frame than the
+        # buffered polygon — align them by using the same rotation origin (polygon.centroid)
+        _orig_rot2 = shapely_rotate(
+            _orig_poly, float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False
+        )
+        _orig_rotated_bounds = _orig_rot2.bounds
+    except Exception:
+        _orig_rotated_bounds = (minx, miny, maxx, maxy)
+
     line_count = 0
     total_line_length_m = 0.0
     total_exposures = 0
@@ -2615,11 +2632,22 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
             if len(all_coords) < 2:
                 continue
             all_coords.sort(key=lambda c: c[1])
-            # Extend ends by lead-in + along-track reach, but cap at the
-            # buffered AOI bounding box so lines don't run far over water
+            # Line ends: extend by lead-in + along-track reach from the AOI intersection.
+            # Ensure lines always reach original AOI boundary + footprint reach.
+            # Cap at buffered AOI bounds + lead-in to prevent excessive water overfly.
             _extend = max(float(lead_in_out_m), 0.0) + _max_along_reach
-            y_start = max(all_coords[0][1] - _extend, miny - max(float(lead_in_out_m), 0.0))
-            y_end   = min(all_coords[-1][1] + _extend, maxy + max(float(lead_in_out_m), 0.0))
+            # Start from intersection points
+            _raw_y0 = all_coords[0][1] - _extend
+            _raw_y1 = all_coords[-1][1] + _extend
+            # Must reach original AOI top/bottom (+ footprint reach)
+            _orig_y0_req = _orig_rotated_bounds[1] - _max_along_reach - max(float(lead_in_out_m), 0.0)
+            _orig_y1_req = _orig_rotated_bounds[3] + _max_along_reach + max(float(lead_in_out_m), 0.0)
+            # Take the more generous of intersection-based vs original-AOI-based
+            y_start = min(_raw_y0, _orig_y0_req)
+            y_end   = max(_raw_y1, _orig_y1_req)
+            # Hard cap: buffered polygon bounds + lead-in (stops water overfly)
+            y_start = max(y_start, miny - max(float(lead_in_out_m), 0.0) * 2)
+            y_end   = min(y_end,   maxy + max(float(lead_in_out_m), 0.0) * 2)
             full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
             seg_length = float(full_seg.length)
             if seg_length <= 0:
@@ -2878,6 +2906,13 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
     _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
+    # Add legend entries for AOI boundaries
+    import matplotlib.patches as _mpatch
+    import matplotlib.lines as _mlines
+    _buf_patch = _mlines.Line2D([], [], color="#ff4444", lw=2.0,
+                                 label="Flight planning boundary (buffered)")
+    _orig_patch = _mlines.Line2D([], [], color="#4488ff", lw=1.5, ls="--",
+                                  label="Original AOI (client boundary)")
 
     # Draw original (unbuffered) AOI as dashed white outline if buffer applied
     if original_aoi_poly is not None and not getattr(original_aoi_poly, "is_empty", True):
@@ -2890,8 +2925,8 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                     continue
                 _ox, _oy = _og.exterior.xy
                 ax.plot(_sx(_ox), _sx(_oy),
-                        color="#ffffff", lw=1.5, ls="--", alpha=0.8, zorder=5,
-                        label="Original AOI")
+                        color="#4488ff", lw=1.5, ls="--", alpha=0.9, zorder=5,
+                        label="Original AOI (client boundary)")
         except Exception:
             pass
 
