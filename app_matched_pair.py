@@ -739,6 +739,8 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
         ["Flight strip coverage", f"{mission_outputs.get('coverage_pct', '—')}%" if mission_outputs.get('coverage_pct') is not None else "—"],
+        ["Client AOI frame coverage", f"{mission_outputs.get('client_aoi_frame_coverage_pct', '—')}%" if mission_outputs.get('client_aoi_frame_coverage_pct') is not None else "—"],
+        ["Client AOI uncovered area", f"{float(mission_outputs.get('client_aoi_frame_gap_area_m2', 0.0)) / 10000.0:.3f} ha" if mission_outputs.get('client_aoi_frame_gap_area_m2') is not None else "—"],
         ["Airborne time", f"{float(mission_outputs.get('airborne_time_s', 0.0)) / 3600.0:.2f} hr"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
         ["Total flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr (airborne + turns)"],
@@ -746,12 +748,8 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
 
 
 def make_kml_export(mission_outputs, solutions=None):
-    """KML export with 4 top-level folders:
-      1. Flight Lines
-      2. Trigger Points  (all cameras combined)
-      3. Frame Coverage  (all cameras combined — unioned footprint per trigger)
-      4. AOI Boundary
-    Plus optional per-camera sub-folders inside Trigger Points and Frame Coverage.
+    """KML export with flight lines, trigger points, frame coverage, AOI boundaries,
+    and (when detected) uncovered client-AOI frame gaps.
     """
     if mission_outputs is None:
         return None
@@ -792,6 +790,10 @@ def make_kml_export(mission_outputs, solutions=None):
     fly_hr     = float(mission_outputs.get("flight_time_s", 0.0)) / 3600.0
     cov_pct    = mission_outputs.get("coverage_pct")
     cov_str    = f"{cov_pct:.1f}%" if cov_pct is not None else "n/a"
+    frame_cov_pct = mission_outputs.get("client_aoi_frame_coverage_pct")
+    frame_cov_str = f"{frame_cov_pct:.3f}%" if frame_cov_pct is not None else "n/a"
+    frame_gap_area_m2 = mission_outputs.get("client_aoi_frame_gap_area_m2")
+    frame_gap_str = f"{float(frame_gap_area_m2) / 10000.0:.3f} ha" if frame_gap_area_m2 is not None else "n/a"
     buf_m      = float(mission_outputs.get("buffered_m", 0.0)) if mission_outputs.get("buffered_m") else 0.0
     buf_str    = f"{buf_m:.0f} m" if buf_m > 0 else "none"
 
@@ -835,14 +837,15 @@ def make_kml_export(mission_outputs, solutions=None):
 <kml xmlns="http://www.opengis.net/kml/2.2">
 <Document>''')
     out.append(f'''  <name>{name} — Flight Plan</name>
-  <description>AOI: {name} | Azimuth: {azimuth:.1f}° | Lines: {line_count} | Line spacing: {line_sp:.0f} m | Photo spacing: {photo_sp:.0f} m | Total length: {total_km:.1f} km | Flying time: {fly_hr:.2f} hr | Strip coverage: {cov_str} | Coverage buffer: {buf_str}</description>''')
+  <description>AOI: {name} | Azimuth: {azimuth:.1f}° | Lines: {line_count} | Line spacing: {line_sp:.0f} m | Photo spacing: {photo_sp:.0f} m | Total length: {total_km:.1f} km | Flying time: {fly_hr:.2f} hr | Strip coverage: {cov_str} | Client AOI frame coverage: {frame_cov_str} | Client AOI uncovered area: {frame_gap_str} | Coverage buffer: {buf_str}</description>''')
 
     # ── Styles ────────────────────────────────────────────────────────────────
     out.append('''  <Style id="fl_odd"><LineStyle><color>fff0c040</color><width>2</width></LineStyle></Style>
   <Style id="fl_even"><LineStyle><color>ff40c0f0</color><width>2</width></LineStyle></Style>
   <Style id="aoi"><LineStyle><color>ff4444ff</color><width>3</width></LineStyle><PolyStyle><color>224444ff</color></PolyStyle></Style>
   <Style id="pt_all"><IconStyle><color>ffffffff</color><scale>0.45</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle><LabelStyle><scale>0</scale></LabelStyle></Style>
-  <Style id="fp_all"><LineStyle><color>aaffffff</color><width>1</width></LineStyle><PolyStyle><color>0cffffff</color></PolyStyle></Style>''')
+  <Style id="fp_all"><LineStyle><color>aaffffff</color><width>1</width></LineStyle><PolyStyle><color>0cffffff</color></PolyStyle></Style>
+  <Style id="gap"><LineStyle><color>ff0000ff</color><width>2.5</width></LineStyle><PolyStyle><color>400000ff</color></PolyStyle></Style>''')
 
     # Per-camera styles
     for lbl, sid, lc, fc, _ in cam_data:
@@ -969,7 +972,7 @@ def make_kml_export(mission_outputs, solutions=None):
         _buf_label = f"4b. Flight Planning Boundary (+{buf_m:.0f} m buffer)" if buf_m > 0 else "4b. Flight Planning Boundary (no buffer)"
         _buf_desc  = (f"AOI expanded by {buf_m:.0f} m coverage buffer — flight lines cover this area"
                       if buf_m > 0 else "No buffer applied")
-        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ffffa658</color><width>2.5</width></LineStyle><PolyStyle><color>10ffa658</color></PolyStyle></Style>')
+        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ff44ffff</color><width>2.5</width></LineStyle><PolyStyle><color>1044ffff</color></PolyStyle></Style>')
         bgeoms = ([buffered_poly] if getattr(buffered_poly,"geom_type","") == "Polygon"
                   else list(getattr(buffered_poly,"geoms",[])))
         ed_buf = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{_buf_label}</SimpleData></SchemaData></ExtendedData>'
@@ -977,6 +980,24 @@ def make_kml_export(mission_outputs, solutions=None):
             if getattr(bgeom,"is_empty",True): continue
             bouter = _cs(list(bgeom.exterior.coords))
             out.append(f'    <Placemark><n>{_buf_label}</n><styleUrl>#buf</styleUrl>{ed_buf}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{bouter}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>')
+        out.append('  </Folder>')
+
+    # ── 5. CLIENT AOI FRAME COVERAGE GAPS ─────────────────────────────────────
+    gap_geom = mission_outputs.get("client_aoi_frame_gap_geom")
+    if gap_geom is not None and not getattr(gap_geom, "is_empty", True):
+        out.append('  <Folder>\n    <name>5. Client AOI Coverage Gaps</name>\n    <visibility>1</visibility>\n    <description>Areas inside the original client AOI that are not covered by any camera frame</description>')
+        gap_geoms = ([gap_geom] if getattr(gap_geom, "geom_type", "") == "Polygon" else list(getattr(gap_geom, "geoms", [])))
+        ed_gap = '<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">5. Client AOI Coverage Gaps</SimpleData></SchemaData></ExtendedData>'
+        for ggeom in gap_geoms:
+            if getattr(ggeom, "is_empty", True):
+                continue
+            gouter = _cs(list(ggeom.exterior.coords))
+            gpm = f'    <Placemark><name>Client AOI gap</name><styleUrl>#gap</styleUrl>{ed_gap}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{gouter}</coordinates></LinearRing></outerBoundaryIs>'
+            for interior in getattr(ggeom, "interiors", []):
+                ginner = _cs(list(interior.coords))
+                gpm += f'<innerBoundaryIs><LinearRing><coordinates>{ginner}</coordinates></LinearRing></innerBoundaryIs>'
+            gpm += '</Polygon></Placemark>'
+            out.append(gpm)
         out.append('  </Folder>')
 
     out.append('''</Document>
@@ -2528,7 +2549,92 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
+def compute_client_aoi_frame_coverage(mission_line_geometries, camera_solutions, client_aoi_polygon, photo_spacing_m):
+    """Exact coverage check using actual camera frame polygons against the client AOI.
+
+    The client AOI is the original AOI loaded by the user, not the buffered
+    flight-planning AOI. Returns exact covered / uncovered areas based on the
+    union of all frame footprints from all enabled cameras at every trigger.
+    """
+    if not SHAPELY_AVAILABLE:
+        return None
+    if client_aoi_polygon is None or getattr(client_aoi_polygon, "is_empty", True):
+        return None
+    if not mission_line_geometries or not camera_solutions or not (np.isfinite(photo_spacing_m) and photo_spacing_m > 0):
+        return None
+
+    clipped_frame_polys = []
+    for line in mission_line_geometries:
+        try:
+            coords = list(line.coords)
+        except Exception:
+            continue
+        if len(coords) < 2:
+            continue
+        x0, y0 = coords[0]
+        x1, y1 = coords[-1]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len <= 0:
+            continue
+        ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
+        ax, ay = -uy, ux
+        trigger_count = max(1, int(math.ceil(seg_len / photo_spacing_m)) + 1)
+
+        for i in range(trigger_count):
+            t = min(i * photo_spacing_m, seg_len)
+            cx = x0 + ux * t
+            cy = y0 + uy * t
+            for _cam_cfg, _sol, _col in camera_solutions:
+                corners = camera_polygon(_sol)
+                if len(corners) != 4:
+                    continue
+                if not all(math.isfinite(v) for xy in corners for v in xy):
+                    continue
+                try:
+                    rotated = [(cx + fcx * ax + fcy * ux, cy + fcx * ay + fcy * uy) for fcx, fcy in corners]
+                    frame_poly = ShapelyPolygon(rotated)
+                    if not frame_poly.is_valid:
+                        frame_poly = frame_poly.buffer(0)
+                    if frame_poly.is_empty or not frame_poly.intersects(client_aoi_polygon):
+                        continue
+                    clipped = frame_poly.intersection(client_aoi_polygon)
+                    if not clipped.is_empty:
+                        clipped_frame_polys.append(clipped)
+                except Exception:
+                    continue
+
+    total_area = float(client_aoi_polygon.area)
+    if total_area <= 0:
+        return None
+
+    if clipped_frame_polys:
+        covered = unary_union(clipped_frame_polys)
+        uncovered = client_aoi_polygon.difference(covered)
+        covered_area = float(covered.area) if not covered.is_empty else 0.0
+    else:
+        covered = None
+        uncovered = client_aoi_polygon
+        covered_area = 0.0
+
+    gap_area = float(uncovered.area) if uncovered is not None and not uncovered.is_empty else 0.0
+    gap_count = 0
+    if uncovered is not None and not getattr(uncovered, "is_empty", True):
+        if getattr(uncovered, "geom_type", "") == "Polygon":
+            gap_count = 1
+        elif hasattr(uncovered, "geoms"):
+            gap_count = sum(1 for g in uncovered.geoms if not getattr(g, "is_empty", True))
+
+    return {
+        "coverage_pct": (100.0 * covered_area / total_area) if total_area else 0.0,
+        "covered_area_m2": covered_area,
+        "gap_area_m2": gap_area,
+        "gap_geom": uncovered,
+        "gap_count": int(gap_count),
+        "has_gaps": gap_area > max(total_area, 1.0) * 1e-9,
+    }
+
+
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, camera_solutions=None):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -2674,6 +2780,34 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     except Exception:
         coverage_pct = None
 
+    # ── Exact client-AOI coverage QA using actual camera frames ─────────────
+    client_aoi_polygon = aoi_payload.get("original_polygon") or aoi_payload.get("polygon")
+    client_aoi_frame_coverage_pct = None
+    client_aoi_frame_gap_area_m2 = None
+    client_aoi_frame_gap_geom = None
+    client_aoi_frame_gap_count = 0
+    client_aoi_has_frame_gaps = None
+    try:
+        if camera_solutions and client_aoi_polygon is not None and not getattr(client_aoi_polygon, "is_empty", True):
+            _frame_cov = compute_client_aoi_frame_coverage(
+                mission_line_geometries=mission_line_geometries,
+                camera_solutions=camera_solutions,
+                client_aoi_polygon=client_aoi_polygon,
+                photo_spacing_m=photo_spacing_m,
+            )
+            if _frame_cov is not None:
+                client_aoi_frame_coverage_pct = round(float(_frame_cov.get("coverage_pct", 0.0)), 3)
+                client_aoi_frame_gap_area_m2 = float(_frame_cov.get("gap_area_m2", 0.0))
+                client_aoi_frame_gap_geom = _frame_cov.get("gap_geom")
+                client_aoi_frame_gap_count = int(_frame_cov.get("gap_count", 0))
+                client_aoi_has_frame_gaps = bool(_frame_cov.get("has_gaps", False))
+    except Exception:
+        client_aoi_frame_coverage_pct = None
+        client_aoi_frame_gap_area_m2 = None
+        client_aoi_frame_gap_geom = None
+        client_aoi_frame_gap_count = 0
+        client_aoi_has_frame_gaps = None
+
     return {
         "name": aoi_payload.get("name", "AOI"),
         "source": aoi_payload.get("source", "unknown"),
@@ -2711,11 +2845,16 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "lon_max":   aoi_payload.get("lon_max"),
         "lat_min":   aoi_payload.get("lat_min"),
         "lat_max":   aoi_payload.get("lat_max"),
+        "client_aoi_frame_coverage_pct": client_aoi_frame_coverage_pct,
+        "client_aoi_frame_gap_area_m2": client_aoi_frame_gap_area_m2,
+        "client_aoi_frame_gap_geom": client_aoi_frame_gap_geom,
+        "client_aoi_frame_gap_count": client_aoi_frame_gap_count,
+        "client_aoi_has_frame_gaps": client_aoi_has_frame_gaps,
         "buffered_m": aoi_payload.get("buffered_m", 0.0),
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, camera_solutions=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -2732,6 +2871,8 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
             turn_time_per_line_min=turn_time_per_line_min,
             storage_profile_label=storage_profile_label,
             storage_per_image_mb=storage_per_image_mb,
+            along_track_reach_m=along_track_reach_m,
+            camera_solutions=camera_solutions,
         )
         if candidate is not None:
             key = (
@@ -3677,6 +3818,7 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
+                camera_solutions=solutions,
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
@@ -3691,6 +3833,7 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
+                camera_solutions=solutions,
             )
 
     # Store original unbuffered polygon for map overlay
@@ -3712,12 +3855,27 @@ else:
         # Coverage QA
         _cov_pct = mission_outputs.get("coverage_pct")
         if _cov_pct is not None:
-            _cov_col = "normal" if _cov_pct >= 99.0 else ("off" if _cov_pct >= 95.0 else "inverse")
             _cov_icon = "✅" if _cov_pct >= 99.0 else ("⚠️" if _cov_pct >= 95.0 else "❌")
-            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of AOI area** — "
-                    + ("Full coverage achieved." if _cov_pct >= 99.0
-                       else f"Partial coverage — {100-_cov_pct:.1f}% of AOI may be missed. "
+            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of planning AOI** — "
+                    + ("Full strip coverage achieved." if _cov_pct >= 99.0
+                       else f"Partial strip coverage — {100-_cov_pct:.1f}% of the planning AOI may be missed. "
                             "Try reducing line spacing or adjusting flight azimuth."))
+
+        _frame_cov_pct = mission_outputs.get("client_aoi_frame_coverage_pct")
+        _frame_gap_area_m2 = mission_outputs.get("client_aoi_frame_gap_area_m2")
+        if _frame_cov_pct is not None:
+            _frame_gap_ha = (float(_frame_gap_area_m2) / 10000.0) if _frame_gap_area_m2 is not None else 0.0
+            if mission_outputs.get("client_aoi_has_frame_gaps"):
+                st.error(
+                    f"❌ **Client AOI frame coverage: {_frame_cov_pct:.3f}%** — "
+                    f"{_frame_gap_ha:.3f} ha inside the original client AOI is not covered by any camera frame. "
+                    "This check uses actual camera frame polygons, not the buffered planning AOI."
+                )
+            else:
+                st.success(
+                    f"✅ **Client AOI frame coverage: {_frame_cov_pct:.3f}%** — "
+                    "the original client AOI is fully covered by camera frames."
+                )
 
         optimized_note = ""
         if mission_outputs.get("flight_direction_optimized"):
@@ -3732,6 +3890,7 @@ else:
             f"Storage assumes a camera-aware {mission_outputs.get('storage_profile_label', 'Uncompressed RAW')} estimate averaging {mission_outputs.get('storage_per_image_mb', 130.0):.1f} MB/image across the enabled cameras." 
             f"{optimized_note}"
             + (f" Coverage buffer: {_aoi_buffer_m:.0f} m applied beyond original AOI boundary." if _aoi_buffer_m > 0 else "")
+            + (f" Client AOI frame coverage: {mission_outputs.get('client_aoi_frame_coverage_pct'):.3f}%." if mission_outputs.get('client_aoi_frame_coverage_pct') is not None else "")
         )
 
         _bm_col1, _bm_col2 = st.columns([1, 2])
