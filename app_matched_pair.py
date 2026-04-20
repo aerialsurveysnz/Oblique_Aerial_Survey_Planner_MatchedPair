@@ -294,10 +294,10 @@ def is_scenario_payload(data):
 
 def save_scenario(data, name):
     path = scenario_path_from_name(name)
-    path.write_text(json.dumps(data, indent=2, default=str))
-    # Also push to GitHub if token is configured — persists across reboots
-    _gh_push_scenario(name, json.dumps(data, indent=2, default=str))
-    return path
+    json_text = json.dumps(data, indent=2, default=str)
+    path.write_text(json_text)
+    gh_ok, gh_err = _gh_push_scenario(name, json_text)
+    return path, gh_ok, gh_err
 
 
 def _gh_config():
@@ -316,10 +316,10 @@ def _gh_config():
 
 
 def _gh_push_scenario(name, json_text):
-    """Push a scenario JSON file to GitHub. Silent on failure."""
+    """Push a scenario JSON file to GitHub. Returns (True, None) on success or (False, error_msg)."""
     cfg = _gh_config()
     if cfg is None:
-        return
+        return False, "GitHub not configured"
     token, repo, branch, folder = cfg
     try:
         import urllib.request, base64
@@ -330,7 +330,6 @@ def _gh_push_scenario(name, json_text):
             "Accept": "application/vnd.github.v3+json",
             "Content-Type": "application/json",
         }
-        # Check if file already exists (need its SHA to update)
         sha = None
         req = urllib.request.Request(api_url, headers=headers)
         try:
@@ -347,56 +346,89 @@ def _gh_push_scenario(name, json_text):
             payload["sha"] = sha
         data = json.dumps(payload).encode()
         req = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
-        with urllib.request.urlopen(req):
-            pass
-    except Exception:
-        pass
+        try:
+            with urllib.request.urlopen(req) as resp:
+                status = resp.status
+                if status not in (200, 201):
+                    return False, f"GitHub returned HTTP {status}"
+                return True, None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+            return False, f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _gh_list_scenarios():
-    """List scenario files from GitHub. Returns list of (name, json_text) or []."""
+    """List scenario files from GitHub using contents API.
+    Returns list of (name, json_text). Each file fetched via its download_url.
+    Returns [] on any failure.
+    """
     cfg = _gh_config()
     if cfg is None:
         return []
     token, repo, branch, folder = cfg
     try:
-        import urllib.request, base64
+        import urllib.request
+        # Get directory listing
         api_url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
         headers = {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
         }
         req = urllib.request.Request(api_url, headers=headers)
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             items = json.loads(resp.read())
+        if not isinstance(items, list):
+            return []
         results = []
         for item in items:
-            if item.get("name", "").endswith(".json"):
-                # Fetch file content
-                dl_url = item.get("download_url")
-                if dl_url:
-                    req2 = urllib.request.Request(dl_url, headers={"Authorization": f"token {token}"})
-                    with urllib.request.urlopen(req2) as r:
-                        results.append((item["name"], r.read().decode()))
+            if not item.get("name", "").endswith(".json"):
+                continue
+            # Use raw_url (unauthenticated) or download_url — faster than API
+            dl_url = item.get("download_url") or item.get("html_url")
+            if not dl_url:
+                continue
+            try:
+                req2 = urllib.request.Request(
+                    dl_url,
+                    headers={"Authorization": f"token {token}"}
+                )
+                with urllib.request.urlopen(req2, timeout=10) as r:
+                    results.append((item["name"], r.read().decode("utf-8")))
+            except Exception:
+                continue  # skip individual file failures, keep going
         return results
     except Exception:
         return []
 
 
 def _sync_scenarios_from_github():
-    """Pull scenario files from GitHub into local SCENARIO_DIR. Call once on startup."""
+    """Pull ALL scenario files from GitHub into local SCENARIO_DIR.
+    Called once per session on startup. Stores sync result in session state
+    so the sidebar can show whether sync succeeded.
+    """
     cfg = _gh_config()
     if cfg is None:
+        st.session_state["gh_sync_result"] = "not_configured"
         return
     ensure_scenario_dir()
+    synced = 0
+    failed = 0
     for filename, json_text in _gh_list_scenarios():
         local_path = SCENARIO_DIR / filename
         try:
             data = json.loads(json_text)
             if is_scenario_payload(data):
-                local_path.write_text(json_text)
+                local_path.write_text(json_text, encoding="utf-8")
+                synced += 1
+            else:
+                failed += 1
         except Exception:
-            pass
+            failed += 1
+    st.session_state["gh_sync_result"] = f"ok:{synced}"
+    if failed:
+        st.session_state["gh_sync_result"] += f":failed:{failed}"
 
 
 def _gh_delete_scenario(name):
@@ -673,6 +705,7 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Average storage per image", f"{storage_per_image_mb:.1f} MB/image"],
         ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
+        ["Flight strip coverage", f"{mission_outputs.get('coverage_pct', '—')}%" if mission_outputs.get('coverage_pct') is not None else "—"],
         ["Airborne time", f"{float(mission_outputs.get('airborne_time_s', 0.0)) / 3600.0:.2f} hr"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
         ["Total flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr (airborne + turns)"],
@@ -680,230 +713,249 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
 
 
 def make_kml_export(mission_outputs, solutions=None):
-    """Generate a KML file with AOI boundary, flight lines, photo points and footprints.
-
-    Flight lines and AOI polygon are stored in local Web Mercator offsets from
-    (mx0, my0).  This function converts them back to WGS84 lon/lat for KML.
-    solutions: list of (cam, sol, colour) from the planner — used for footprints.
-    Returns KML as bytes, or None if no geographic reference is available.
+    """KML export with 4 top-level folders:
+      1. Flight Lines
+      2. Trigger Points  (all cameras combined)
+      3. Frame Coverage  (all cameras combined — unioned footprint per trigger)
+      4. AOI Boundary
+    Plus optional per-camera sub-folders inside Trigger Points and Frame Coverage.
     """
     if mission_outputs is None:
         return None
-
     mx0 = mission_outputs.get("mx0")
     my0 = mission_outputs.get("my0")
     if mx0 is None or my0 is None:
         return None
 
-    import math as _math
+    import math as _m
     _R = 6378137.0
 
-    def _to_wgs84(lx, ly):
-        """Local Mercator offset (m) → WGS84 (lon, lat)."""
-        lon = _math.degrees((mx0 + lx) / _R)
-        lat = _math.degrees(2 * _math.atan(_math.exp((my0 + ly) / _R)) - _math.pi / 2)
+    def _wgs84(lx, ly):
+        lon = _m.degrees((mx0 + lx) / _R)
+        lat = _m.degrees(2 * _m.atan(_m.exp((my0 + ly) / _R)) - _m.pi / 2)
         return lon, lat
 
-    def _coords_str(pts):
-        """List of (x,y) local offsets → KML coordinates string."""
-        parts = []
-        for x, y in pts:
-            lon, lat = _to_wgs84(x, y)
-            parts.append(f"{lon:.8f},{lat:.8f},0")
-        return " ".join(parts)
+    def _cs(pts):
+        return " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in pts)
 
-    name        = mission_outputs.get("name", "AOI")
-    azimuth     = float(mission_outputs.get("flight_azimuth_deg", 0.0))
-    line_count  = int(mission_outputs.get("line_count", 0))
-    line_sp_m   = float(mission_outputs.get("line_spacing_m", 0.0))
-    photo_sp_m  = float(mission_outputs.get("photo_spacing_m", 0.0))
-    total_km    = float(mission_outputs.get("total_line_length_m", 0.0)) / 1000.0
-    fly_hr      = float(mission_outputs.get("flight_time_s", 0.0)) / 3600.0
+    def _poly_pm(style_id, corners):
+        """Return a KML Placemark string for a polygon (corners in local offsets)."""
+        cl = corners + [corners[0]]
+        cs = " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in cl)
+        return (f'    <Placemark><styleUrl>#{style_id}</styleUrl>'
+                f'<Polygon><tessellate>1</tessellate>'
+                f'<outerBoundaryIs><LinearRing><coordinates>{cs}</coordinates>'
+                f'</LinearRing></outerBoundaryIs></Polygon></Placemark>')
 
-    lines = []
-    lines.append('''<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>''')
-    lines.append(f"  <name>{name} — Flight Plan</name>")
-    lines.append(f"""  <description>
-    AOI: {name}
-    Flight azimuth: {azimuth:.1f}°
-    Flight lines: {line_count}
-    Line spacing: {line_sp_m:.1f} m
-    Photo spacing: {photo_sp_m:.1f} m
-    Total line length: {total_km:.2f} km
-    Estimated flying time: {fly_hr:.2f} hr
-  </description>""")
+    def _pt_pm(style_id, lx, ly):
+        lo, la = _wgs84(lx, ly)
+        return (f'    <Placemark><styleUrl>#{style_id}</styleUrl>'
+                f'<Point><coordinates>{lo:.8f},{la:.8f},0</coordinates></Point></Placemark>')
 
-    # ── Styles ────────────────────────────────────────────────────────────────
-    lines.append("""  <Style id="aoi_style">
-    <LineStyle><color>ffff4444</color><width>2.5</width></LineStyle>
-    <PolyStyle><color>33ff4444</color></PolyStyle>
-  </Style>
-  <Style id="flightline_style">
-    <LineStyle><color>fff0c040</color><width>1.5</width></LineStyle>
-  </Style>
-  <Style id="flightline_odd_style">
-    <LineStyle><color>ff40c0f0</color><width>1.5</width></LineStyle>
-  </Style>""")
+    name       = mission_outputs.get("name", "AOI")
+    azimuth    = float(mission_outputs.get("flight_azimuth_deg", 0.0))
+    line_count = int(mission_outputs.get("line_count", 0))
+    line_sp    = float(mission_outputs.get("line_spacing_m", 0.0))
+    photo_sp   = float(mission_outputs.get("photo_spacing_m", 0.0))
+    total_km   = float(mission_outputs.get("total_line_length_m", 0.0)) / 1000.0
+    fly_hr     = float(mission_outputs.get("flight_time_s", 0.0)) / 3600.0
+    cov_pct    = mission_outputs.get("coverage_pct")
+    cov_str    = f"{cov_pct:.1f}%" if cov_pct is not None else "n/a"
+    buf_m      = float(mission_outputs.get("buffered_m", 0.0)) if mission_outputs.get("buffered_m") else 0.0
+    buf_str    = f"{buf_m:.0f} m" if buf_m > 0 else "none"
 
-    # ── AOI boundary polygon ──────────────────────────────────────────────────
-    aoi_poly = mission_outputs.get("aoi_polygon")
-    if aoi_poly is not None and not getattr(aoi_poly, "is_empty", True):
-        lines.append("""  <Folder><name>AOI Boundary</name>""")
-        geoms = [aoi_poly] if getattr(aoi_poly, "geom_type", "") == "Polygon" else list(getattr(aoi_poly, "geoms", []))
-        for geom in geoms:
-            if getattr(geom, "is_empty", True):
-                continue
-            outer = list(geom.exterior.coords)
-            outer_str = _coords_str(outer)
-            lines.append(f"""    <Placemark>
-      <name>AOI boundary</name>
-      <styleUrl>#aoi_style</styleUrl>
-      <Polygon>
-        <tessellate>1</tessellate>
-        <outerBoundaryIs><LinearRing>
-          <coordinates>{outer_str}</coordinates>
-        </LinearRing></outerBoundaryIs>""")
-            for interior in getattr(geom, "interiors", []):
-                inner_str = _coords_str(list(interior.coords))
-                lines.append(f"""        <innerBoundaryIs><LinearRing>
-          <coordinates>{inner_str}</coordinates>
-        </LinearRing></innerBoundaryIs>""")
-            lines.append("""      </Polygon>
-    </Placemark>""")
-        lines.append("""  </Folder>""")
+    mission_lines = mission_outputs.get("mission_line_geometries", [])
+    aoi_poly      = (mission_outputs.get("original_aoi_polygon")
+                   or mission_outputs.get("aoi_polygon"))  # prefer original unbuffered
 
-    # ── Flight lines ──────────────────────────────────────────────────────────
-    mission_line_geometries = mission_outputs.get("mission_line_geometries", [])
-    if mission_line_geometries:
-        lines.append("""  <Folder><name>Flight Lines</name>""")
-        for idx, line_geom in enumerate(mission_line_geometries, 1):
-            try:
-                coords = list(line_geom.coords)
-                if len(coords) < 2:
-                    continue
-                coord_str = _coords_str(coords)
-                style = "flightline_style" if idx % 2 == 1 else "flightline_odd_style"
-                lines.append(f"""    <Placemark>
-      <name>Line {idx}</name>
-      <styleUrl>#{style}</styleUrl>
-      <LineString>
-        <tessellate>1</tessellate>
-        <coordinates>{coord_str}</coordinates>
-      </LineString>
-    </Placemark>""")
-            except Exception:
-                continue
-        lines.append("""  </Folder>""")
-
-    # ── Camera footprint styles (one per camera) ──────────────────────────────
-    # KML colour format: AABBGGRR
-    _cam_kml_cols = {
-        "nadir":   ("ff00ffff", "2200ffff"),
-        "right":   ("ff0000ff", "220000ff"),
-        "left":    ("ff00ff00", "2200ff00"),
-        "fore":    ("ffff00ff", "22ff00ff"),
-        "aft":     ("ff00e5ff", "2200e5ff"),
-        "default": ("fffff0c0", "22fff0c0"),
+    # KML colours: AABBGGRR
+    _cam_cols = {
+        "nadir":   ("ff00ffff", "1800ffff"),
+        "right":   ("ff0000ff", "180000ff"),
+        "left":    ("ff00cc00", "1800cc00"),
+        "fore":    ("ffff00ff", "18ff00ff"),
+        "aft":     ("ff00ccff", "1800ccff"),
+        "default": ("ffffffff", "18ffffff"),
     }
-
-    def _cam_kml_colour(label):
+    def _ccol(label):
         lbl = (label or "").lower()
-        for key in ("nadir", "right", "left", "fore", "aft"):
-            if key in lbl:
-                return _cam_kml_cols[key]
-        return _cam_kml_cols["default"]
+        for k in ("nadir","right","left","fore","aft"):
+            if k in lbl: return _cam_cols[k]
+        return _cam_cols["default"]
 
+    # Collect per-camera footprint corners
+    cam_data = []  # list of (label, sid, line_col, fill_col, fp_corners)
     if solutions:
         for _cam, _sol, _ in solutions:
-            _lbl = (_sol.label or "camera")
-            _sid = _lbl.replace(" ", "_")
-            _lc, _fc = _cam_kml_colour(_lbl)
-            lines.append(f'''  <Style id="fp_{_sid}">
-    <LineStyle><color>{_lc}</color><width>1</width></LineStyle>
-    <PolyStyle><color>{_fc}</color></PolyStyle>
-  </Style>
-  <Style id="pt_{_sid}">
-    <IconStyle>
-      <color>{_lc}</color><scale>0.4</scale>
-      <Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>
-    </IconStyle>
-    <LabelStyle><scale>0</scale></LabelStyle>
-  </Style>''')
-
-    # ── Photo points and footprints per camera ────────────────────────────────
-    photo_spacing_m = float(mission_outputs.get("photo_spacing_m", 0.0))
-
-    if solutions and mission_line_geometries and photo_spacing_m > 0:
-        import math as _m2
-        for _cam, _sol, _ in solutions:
-            _lbl = _sol.label or "Camera"
-            _sid = _lbl.replace(" ", "_")
+            lbl = _sol.label or "Camera"
+            sid = lbl.replace(" ", "_")
+            lc, fc = _ccol(lbl)
             try:
-                _fp_corners = camera_polygon(_sol)
-                if not _fp_corners or not all(_m2.isfinite(v) for xy in _fp_corners for v in xy):
-                    _fp_corners = None
+                corners = camera_polygon(_sol)
+                if not corners or not all(_m.isfinite(v) for xy in corners for v in xy):
+                    corners = None
             except Exception:
-                _fp_corners = None
+                corners = None
+            cam_data.append((lbl, sid, lc, fc, corners))
 
-            _pt_placemarks = []
-            _fp_placemarks = []
+    # ── Build KML ─────────────────────────────────────────────────────────────
+    out = []
+    out.append('''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>''')
+    out.append(f'''  <name>{name} — Flight Plan</name>
+  <description>AOI: {name} | Azimuth: {azimuth:.1f}° | Lines: {line_count} | Line spacing: {line_sp:.0f} m | Photo spacing: {photo_sp:.0f} m | Total length: {total_km:.1f} km | Flying time: {fly_hr:.2f} hr | Strip coverage: {cov_str} | Coverage buffer: {buf_str}</description>''')
 
-            for line_geom in mission_line_geometries:
-                try:
-                    _lc2 = list(line_geom.coords)
-                    if len(_lc2) < 2:
-                        continue
-                    _x0, _y0 = _lc2[0]
-                    _x1, _y1 = _lc2[-1]
-                    _seg = _m2.hypot(_x1 - _x0, _y1 - _y0)
-                    if _seg < 1.0:
-                        continue
-                    _ux, _uy = (_x1-_x0)/_seg, (_y1-_y0)/_seg
-                    _ax, _ay = -_uy, _ux  # across-track unit vector
-                    _n = max(1, int(_m2.ceil(_seg / photo_spacing_m)) + 1)
-                    for _i in range(_n):
-                        _t = min(_i * photo_spacing_m, _seg)
-                        _cx = _x0 + _ux * _t
-                        _cy = _y0 + _uy * _t
-                        _lo, _la = _to_wgs84(_cx, _cy)
-                        _pt_placemarks.append(
-                            f'''    <Placemark><styleUrl>#pt_{_sid}</styleUrl>''' +
-                            f'''<Point><coordinates>{_lo:.8f},{_la:.8f},0</coordinates></Point></Placemark>'''
-                        )
-                        if _fp_corners:
-                            _fw = []
-                            for _fcx, _fcy in _fp_corners:
-                                _wx = _cx + _fcx * _ax + _fcy * _ux
-                                _wy = _cy + _fcx * _ay + _fcy * _uy
-                                _fw.append(_to_wgs84(_wx, _wy))
-                            _fw.append(_fw[0])
-                            _fcs = " ".join(f"{lo:.8f},{la:.8f},0" for lo, la in _fw)
-                            _fp_placemarks.append(f'''    <Placemark>
-      <styleUrl>#fp_{_sid}</styleUrl>
-      <Polygon><tessellate>1</tessellate>
-        <outerBoundaryIs><LinearRing>
-          <coordinates>{_fcs}</coordinates>
-        </LinearRing></outerBoundaryIs>
-      </Polygon>
+    # ── Styles ────────────────────────────────────────────────────────────────
+    out.append('''  <Style id="fl_odd"><LineStyle><color>fff0c040</color><width>2</width></LineStyle></Style>
+  <Style id="fl_even"><LineStyle><color>ff40c0f0</color><width>2</width></LineStyle></Style>
+  <Style id="aoi"><LineStyle><color>ff4444ff</color><width>3</width></LineStyle><PolyStyle><color>224444ff</color></PolyStyle></Style>
+  <Style id="pt_all"><IconStyle><color>ffffffff</color><scale>0.45</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle><LabelStyle><scale>0</scale></LabelStyle></Style>
+  <Style id="fp_all"><LineStyle><color>aaffffff</color><width>1</width></LineStyle><PolyStyle><color>0cffffff</color></PolyStyle></Style>''')
+
+    # Per-camera styles
+    for lbl, sid, lc, fc, _ in cam_data:
+        out.append(f'''  <Style id="pt_{sid}"><IconStyle><color>{lc}</color><scale>0.45</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle><LabelStyle><scale>0</scale></LabelStyle></Style>
+  <Style id="fp_{sid}"><LineStyle><color>{lc}</color><width>1</width></LineStyle><PolyStyle><color>{fc}</color></PolyStyle></Style>''')
+
+    # ── 1. FLIGHT LINES ───────────────────────────────────────────────────────
+    if mission_lines:
+        out.append('''  <Folder>
+    <name>1. Flight Lines</name>
+    <visibility>1</visibility>''')
+        for idx, lg in enumerate(mission_lines, 1):
+            try:
+                coords = list(lg.coords)
+                if len(coords) < 2: continue
+                cs = _cs(coords)
+                sty = "fl_odd" if idx % 2 == 1 else "fl_even"
+                out.append(f'''    <Placemark><name>Line {idx}</name><styleUrl>#{sty}</styleUrl>
+      <LineString><tessellate>1</tessellate><coordinates>{cs}</coordinates></LineString>
     </Placemark>''')
+            except Exception:
+                continue
+        out.append('''  </Folder>''')
+
+    # ── Build trigger positions per line (shared between folders 2 & 3) ───────
+    trigger_positions = []  # list of (cx, cy, ux, uy, ax, ay) per trigger
+    if mission_lines and photo_sp > 0:
+        import math as _m2
+        for lg in mission_lines:
+            try:
+                lc2 = list(lg.coords)
+                if len(lc2) < 2: continue
+                x0,y0 = lc2[0]; x1,y1 = lc2[-1]
+                seg = _m2.hypot(x1-x0, y1-y0)
+                if seg < 1: continue
+                ux,uy = (x1-x0)/seg, (y1-y0)/seg
+                ax,ay = -uy, ux
+                n = max(1, int(_m2.ceil(seg/photo_sp)) + 1)
+                for i in range(n):
+                    t = min(i*photo_sp, seg)
+                    trigger_positions.append((x0+ux*t, y0+uy*t, ux, uy, ax, ay))
+            except Exception:
+                continue
+
+    # ── 2. TRIGGER POINTS ─────────────────────────────────────────────────────
+    if trigger_positions:
+        out.append('''  <Folder>
+    <name>2. Trigger Points</name>
+    <visibility>1</visibility>
+    <description>One point per trigger event — all cameras fire simultaneously</description>''')
+
+        # Combined (all cameras) — always visible
+        out.append('''    <Folder><name>All cameras combined</name><visibility>1</visibility>''')
+        for cx,cy,*_ in trigger_positions:
+            out.append(_pt_pm("pt_all", cx, cy))
+        out.append('''    </Folder>''')
+
+        # Per-camera sub-folders — collapsed by default
+        for lbl, sid, lc, fc, _ in cam_data:
+            out.append(f'''    <Folder><name>{lbl}</name><visibility>0</visibility>''')
+            for cx,cy,*_ in trigger_positions:
+                out.append(_pt_pm(f"pt_{sid}", cx, cy))
+            out.append('''    </Folder>''')
+
+        out.append('''  </Folder>''')
+
+    # ── 3. FRAME COVERAGE ─────────────────────────────────────────────────────
+    if trigger_positions and cam_data:
+        out.append('''  <Folder>
+    <name>3. Frame Coverage</name>
+    <visibility>1</visibility>
+    <description>Ground footprint of each camera frame</description>''')
+
+        # Combined footprint (union colour) — show all cameras together
+        out.append('''    <Folder><name>All cameras combined</name><visibility>1</visibility>''')
+        for cx,cy,ux,uy,ax,ay in trigger_positions:
+            for lbl, sid, lc, fc, corners in cam_data:
+                if not corners: continue
+                try:
+                    rot = [(cx + fcx*ax + fcy*ux, cy + fcx*ay + fcy*uy)
+                           for fcx,fcy in corners]
+                    out.append(_poly_pm("fp_all", rot))
                 except Exception:
                     continue
+        out.append('''    </Folder>''')
 
-            if _pt_placemarks:
-                lines.append(f'''  <Folder><n>Photo points — {_lbl}</n>''')
-                lines.extend(_pt_placemarks)
-                lines.append('''  </Folder>''')
-            if _fp_placemarks:
-                lines.append(f'''  <Folder><n>Photo footprints — {_lbl}</n>''')
-                lines.extend(_fp_placemarks)
-                lines.append('''  </Folder>''')
+        # Per-camera sub-folders — collapsed by default
+        for lbl, sid, lc, fc, corners in cam_data:
+            if not corners: continue
+            out.append(f'''    <Folder><name>{lbl}</name><visibility>0</visibility>''')
+            for cx,cy,ux,uy,ax,ay in trigger_positions:
+                try:
+                    rot = [(cx + fcx*ax + fcy*ux, cy + fcx*ay + fcy*uy)
+                           for fcx,fcy in corners]
+                    out.append(_poly_pm(f"fp_{sid}", rot))
+                except Exception:
+                    continue
+            out.append('''    </Folder>''')
 
-    lines.append("""</Document>
-</kml>""")
+        out.append('''  </Folder>''')
 
-    return "\n".join(lines).encode("utf-8")
+    # ── 4. AOI BOUNDARY ───────────────────────────────────────────────────────
+    if aoi_poly is not None and not getattr(aoi_poly, "is_empty", True):
+        out.append('''  <Folder>
+    <name>4. AOI Boundary</name>
+    <visibility>1</visibility>''')
+        geoms = ([aoi_poly] if getattr(aoi_poly,"geom_type","") == "Polygon"
+                 else list(getattr(aoi_poly,"geoms",[])))
+        for geom in geoms:
+            if getattr(geom,"is_empty",True): continue
+            outer_str = _cs(list(geom.exterior.coords))
+            pm = f'''    <Placemark><name>AOI</name><styleUrl>#aoi</styleUrl>
+      <Polygon><tessellate>1</tessellate>
+        <outerBoundaryIs><LinearRing><coordinates>{outer_str}</coordinates></LinearRing></outerBoundaryIs>'''
+            for interior in getattr(geom,"interiors",[]):
+                istr = _cs(list(interior.coords))
+                pm += f'''\n        <innerBoundaryIs><LinearRing><coordinates>{istr}</coordinates></LinearRing></innerBoundaryIs>'''
+            pm += '''\n      </Polygon>\n    </Placemark>'''
+            out.append(pm)
+        out.append('''  </Folder>''')
+
+    # ── 4b. BUFFERED AOI (flight planning boundary) ──────────────────────────
+    buffered_poly = mission_outputs.get("aoi_polygon")
+    if buf_m > 0 and buffered_poly is not None and not getattr(buffered_poly,"is_empty",True):
+        out.append('''  <Folder>
+    <n>4b. Flight Planning Boundary (buffered)</n>
+    <visibility>1</visibility>
+    <description>AOI expanded by coverage buffer — flight lines cover this area</description>
+  <Style id="buf"><LineStyle><color>ff44ffff</color><width>2</width></LineStyle><PolyStyle><color>0844ffff</color></PolyStyle></Style>''')
+        bgeoms = ([buffered_poly] if getattr(buffered_poly,"geom_type","") == "Polygon"
+                  else list(getattr(buffered_poly,"geoms",[])))
+        for bgeom in bgeoms:
+            if getattr(bgeom,"is_empty",True): continue
+            bouter = _cs(list(bgeom.exterior.coords))
+            out.append(f'''    <Placemark><n>Buffered AOI (+{buf_m:.0f} m)</n><styleUrl>#buf</styleUrl>
+      <Polygon><tessellate>1</tessellate>
+        <outerBoundaryIs><LinearRing><coordinates>{bouter}</coordinates></LinearRing></outerBoundaryIs>
+      </Polygon>
+    </Placemark>''')
+        out.append('''  </Folder>''')
+
+    out.append('''</Document>
+</kml>''')
+    return "\n".join(out).encode("utf-8")
 
 
 def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None):
@@ -1199,6 +1251,8 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Sync scenarios from GitHub once per session (persists across Cloud reboots)
+# Always sync from GitHub at session start — ensures scenarios survive reboots
+# Session state resets on reboot so this runs fresh each time
 if "gh_scenarios_synced" not in st.session_state:
     _sync_scenarios_from_github()
     st.session_state.gh_scenarios_synced = True
@@ -2378,6 +2432,30 @@ def parse_kml_aoi(path):
     }
 
 
+def build_buffered_aoi(aoi_payload, buffer_m):
+    """Return a copy of aoi_payload with the polygon expanded by buffer_m metres.
+    The buffer is applied in the local Mercator coordinate space.
+    All geographic fields (lon0, lat0, mx0, my0, bounds) are updated to reflect
+    the larger polygon.
+    """
+    if aoi_payload is None or not SHAPELY_AVAILABLE:
+        return aoi_payload
+    poly = aoi_payload.get("polygon")
+    if poly is None or buffer_m <= 0:
+        return aoi_payload
+    try:
+        buffered = poly.buffer(float(buffer_m), join_style=2)  # mitre join for sharp corners
+        if buffered.is_empty or not buffered.is_valid:
+            return aoi_payload
+        result = dict(aoi_payload)
+        result["polygon"]  = buffered
+        result["area_m2"]  = float(buffered.area)
+        result["buffered_m"] = float(buffer_m)
+        return result
+    except Exception:
+        return aoi_payload
+
+
 def build_standard_aoi(area_km2=100.0):
     if not SHAPELY_AVAILABLE:
         raise RuntimeError("Shapely is required for AOI / mission outputs.")
@@ -2438,23 +2516,24 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
 
     rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
 
-    # Simplify complex polygons before the intersection loop — this is the biggest
-    # speed win for large KML files with thousands of vertices.
-    # Tolerance = 1m preserves all meaningful geometry.
-    try:
-        simplified = rotated.simplify(1.0, preserve_topology=True)
-        if not simplified.is_empty and simplified.is_valid:
-            rotated = simplified
-    except Exception:
-        pass
+    # Note: we intentionally do NOT simplify the rotated polygon here.
+    # Simplification can shift edge vertices inward and cause flight lines
+    # to miss the AOI boundary. The polygon is already simplified at parse
+    # time (parse_kml_aoi) which is sufficient for speed.
 
     minx, miny, maxx, maxy = rotated.bounds
     width = maxx - minx
     if not np.isfinite(width) or width < 0:
         return None
 
-    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 1)
-    offsets = [minx + i * line_spacing_m for i in range(n_candidates)]
+    # Generate offsets that fully span minx..maxx with one extra line on each
+    # side so partial-width edge strips are never missed.
+    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 2)
+    # Start half a spacing before minx so edge of AOI is always covered
+    start_x = minx - (line_spacing_m * 0.5)
+    offsets = [start_x + i * line_spacing_m for i in range(n_candidates + 1)]
+    # Keep only those within the AOI bounds (plus one line width margin)
+    offsets = [x for x in offsets if x <= maxx + line_spacing_m]
     pad = max(maxy - miny, 1.0) + max(float(lead_in_out_m), 0.0) + 1000.0
 
     line_count = 0
@@ -2517,10 +2596,35 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         except Exception:
             continue
 
+    # ── Coverage QA: check what fraction of AOI is covered by flight strips ──
+    coverage_pct = None
+    try:
+        if SHAPELY_AVAILABLE and raw_segments and line_spacing_m > 0:
+            half_w = line_spacing_m / 2.0
+            strips = []
+            for seg in raw_segments:
+                coords = list(seg.coords)
+                if len(coords) >= 2:
+                    # Buffer each segment by half line spacing to form a strip
+                    strips.append(seg.buffer(half_w, cap_style=2))  # flat caps
+            if strips:
+                covered = unary_union(strips)
+                # Rotate back to original orientation for comparison with polygon
+                covered_orig = shapely_rotate(
+                    covered, -float(flight_azimuth_deg),
+                    origin=polygon.centroid, use_radians=False
+                )
+                intersection_area = polygon.intersection(covered_orig).area
+                if polygon.area > 0:
+                    coverage_pct = round(100.0 * intersection_area / polygon.area, 1)
+    except Exception:
+        coverage_pct = None
+
     return {
         "name": aoi_payload.get("name", "AOI"),
         "source": aoi_payload.get("source", "unknown"),
         "area_m2": float(aoi_payload.get("area_m2", polygon.area)),
+        "coverage_pct": coverage_pct,
         "line_count": int(line_count),
         "total_line_length_m": float(total_line_length_m),
         "average_line_length_m": float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
@@ -2540,7 +2644,8 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "flight_azimuth_deg": float(flight_azimuth_deg),
         "lead_in_out_m": float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
-        "aoi_polygon": polygon,
+        "aoi_polygon": polygon,        # buffered polygon (for flight line clipping display)
+        "original_aoi_polygon": aoi_payload.get("polygon"),  # original unbuffered AOI
         # Geographic reference — passed through from aoi_payload so
         # make_aoi_mission_figure can fetch map tiles for the correct location.
         "lon0":    aoi_payload.get("lon0"),
@@ -2590,7 +2695,7 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
     return result
 
 
-def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, basemap_style="osm"):
+def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, basemap_style="osm", original_aoi_poly=None):
     if mission_outputs is None:
         return None
     polygon = mission_outputs.get("aoi_polygon")
@@ -2651,6 +2756,22 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
     _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
+
+    # Draw original (unbuffered) AOI as dashed white outline if buffer applied
+    if original_aoi_poly is not None and not getattr(original_aoi_poly, "is_empty", True):
+        try:
+            _orig_geoms = ([original_aoi_poly]
+                           if getattr(original_aoi_poly, "geom_type", "") == "Polygon"
+                           else list(getattr(original_aoi_poly, "geoms", [])))
+            for _og in _orig_geoms:
+                if getattr(_og, "is_empty", True):
+                    continue
+                _ox, _oy = _og.exterior.xy
+                ax.plot(_sx(_ox), _sx(_oy),
+                        color="#ffffff", lw=1.5, ls="--", alpha=0.8, zorder=5,
+                        label="Original AOI")
+        except Exception:
+            pass
 
     for line in mission_outputs.get("mission_line_geometries", []):
         try:
@@ -2916,7 +3037,14 @@ st.sidebar.markdown("---")
 _gh_configured = _gh_config() is not None
 st.sidebar.subheader("💾 Save / Load")
 if _gh_configured:
-    st.sidebar.caption("☁️ GitHub sync active — scenarios persist across reboots.")
+    _sync_result = st.session_state.get("gh_sync_result", "")
+    if _sync_result.startswith("ok:"):
+        _n = _sync_result.split(":")[1]
+        st.sidebar.caption(f"☁️ GitHub sync active — {_n} scenario(s) loaded from repo.")
+    elif _sync_result == "not_configured":
+        st.sidebar.caption("☁️ GitHub sync active.")
+    else:
+        st.sidebar.caption("☁️ GitHub sync active — scenarios persist across reboots.")
 else:
     st.sidebar.caption("⚠️ No GitHub sync — scenarios are lost on app reboot. Ask admin to configure GitHub secrets.")
 
@@ -2935,11 +3063,18 @@ if st.sidebar.button("Save scenario"):
         "sidelap_pct": side_pct,
         "reciprocal": reciprocal,
     }
-    saved_path = save_scenario(_sc_data, sc_name)
-    _gh_ok = _gh_config() is not None
-    _gh_msg = " and synced to GitHub ✓" if _gh_ok else " (local only — configure GitHub secrets to persist)"
+    saved_path, _gh_ok, _gh_err = save_scenario(_sc_data, sc_name)
+    if _gh_ok:
+        _gh_msg = " and synced to GitHub ✓"
+        _flash_level = "success"
+    elif _gh_config() is None:
+        _gh_msg = " (local only — configure GitHub secrets to persist)"
+        _flash_level = "warning"
+    else:
+        _gh_msg = f" — GitHub sync FAILED: {_gh_err}"
+        _flash_level = "error"
     st.session_state.scenario_flash_message = {
-        "level": "success" if _gh_ok else "warning",
+        "level": _flash_level,
         "text": f"Saved {saved_path.name}{_gh_msg}",
     }
     st.session_state.selected_scenario_label = saved_path.name
@@ -3284,6 +3419,19 @@ else:
             st.session_state.selected_aoi_payload = aoi_payload
             st.session_state.selected_aoi_name = aoi_payload["name"]
             st.caption("Standard example uses a square AOI so you can compare option changes on a common 100 km²-style block.")
+
+            # ── Coverage buffer ───────────────────────────────────────────────
+            st.markdown("**Coverage buffer**")
+            aoi_buffer_m = st.number_input(
+                f"Buffer distance ({dist_unit})",
+                min_value=0.0,
+                max_value=m_to_unit(10000.0, dist_unit),
+                value=m_to_unit(500.0, dist_unit),
+                step=m_to_unit(100.0, dist_unit),
+                key="aoi_buffer_display",
+                help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage.",
+            )
+            aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
         else:
             kml_files = list_library_kmls()
             if not kml_files:
@@ -3306,6 +3454,24 @@ else:
                 if st.session_state.get("selected_aoi_payload") is not None:
                     aoi_payload = st.session_state.selected_aoi_payload
                     st.caption(f"Loaded AOI: {st.session_state.get('selected_aoi_name', aoi_payload.get('name', 'KML'))}")
+
+            # ── Coverage buffer ───────────────────────────────────────────────
+            st.markdown("**Coverage buffer**")
+            _buf_col1, _buf_col2 = st.columns([2, 1])
+            aoi_buffer_m = _buf_col1.number_input(
+                f"Buffer distance ({dist_unit})",
+                min_value=0.0,
+                max_value=m_to_unit(10000.0, dist_unit),
+                value=m_to_unit(500.0, dist_unit),
+                step=m_to_unit(100.0, dist_unit),
+                key="aoi_buffer_display",
+                help="Flight lines extend this distance beyond the AOI boundary to ensure full coverage of the edge. "
+                     "Default 500 m ensures the outermost oblique cameras fully cover the AOI perimeter.",
+            )
+            aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
+            _buf_col2.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+            if aoi_buffer_m > 0:
+                _buf_col2.caption(f"≈ {aoi_buffer_m:.0f} m buffer")
 
     with controls_right:
         optimize_flight_direction = st.checkbox(
@@ -3362,9 +3528,14 @@ else:
         storage_per_image_mb = STORAGE_PROFILE_OPTIONS[storage_profile_label]
 
     if aoi_payload is not None:
+        # Apply coverage buffer — expand AOI before flight line generation
+        _aoi_buffer_m = st.session_state.get("aoi_buffer_display", 500.0)
+        _aoi_buffer_m = unit_to_m(float(_aoi_buffer_m), dist_unit)
+        _aoi_for_planning = build_buffered_aoi(aoi_payload, _aoi_buffer_m)
+
         if optimize_flight_direction:
             mission_outputs = optimize_aoi_flight_direction(
-                aoi_payload=aoi_payload,
+                aoi_payload=_aoi_for_planning,
                 line_spacing_m=mc.recommended_line_spacing_m,
                 photo_spacing_m=mc.recommended_photo_spacing_m,
                 speed_ms=speed_ms,
@@ -3377,7 +3548,7 @@ else:
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
-                aoi_payload=aoi_payload,
+                aoi_payload=_aoi_for_planning,
                 line_spacing_m=mc.recommended_line_spacing_m,
                 photo_spacing_m=mc.recommended_photo_spacing_m,
                 speed_ms=speed_ms,
@@ -3388,6 +3559,9 @@ else:
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
             )
+
+    # Store original unbuffered polygon for map overlay
+    _original_aoi_poly = aoi_payload.get("polygon") if aoi_payload else None
 
     if mission_outputs is not None:
         m1, m2, m3, m4 = st.columns(4)
@@ -3402,6 +3576,16 @@ else:
         m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
         m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 3600.0:.2f} hr")
 
+        # Coverage QA
+        _cov_pct = mission_outputs.get("coverage_pct")
+        if _cov_pct is not None:
+            _cov_col = "normal" if _cov_pct >= 99.0 else ("off" if _cov_pct >= 95.0 else "inverse")
+            _cov_icon = "✅" if _cov_pct >= 99.0 else ("⚠️" if _cov_pct >= 95.0 else "❌")
+            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of AOI area** — "
+                    + ("Full coverage achieved." if _cov_pct >= 99.0
+                       else f"Partial coverage — {100-_cov_pct:.1f}% of AOI may be missed. "
+                            "Try reducing line spacing or adjusting flight azimuth."))
+
         optimized_note = ""
         if mission_outputs.get("flight_direction_optimized"):
             optimized_note = (
@@ -3414,6 +3598,7 @@ else:
             f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs. "
             f"Storage assumes a camera-aware {mission_outputs.get('storage_profile_label', 'Uncompressed RAW')} estimate averaging {mission_outputs.get('storage_per_image_mb', 130.0):.1f} MB/image across the enabled cameras." 
             f"{optimized_note}"
+            + (f" Coverage buffer: {_aoi_buffer_m:.0f} m applied beyond original AOI boundary." if _aoi_buffer_m > 0 else "")
         )
 
         _bm_col1, _bm_col2 = st.columns([1, 2])
@@ -3439,7 +3624,8 @@ else:
                 )
         _fig_result = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
                                               show_basemap=_show_basemap,
-                                              basemap_style=_basemap_style)
+                                              basemap_style=_basemap_style,
+                                              original_aoi_poly=_original_aoi_poly)
         if isinstance(_fig_result, tuple):
             aoi_fig, _basemap_err = _fig_result
         else:
