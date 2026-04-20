@@ -2697,27 +2697,28 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         except Exception:
             continue
 
-    # ── Coverage QA: check what fraction of AOI is covered by flight strips ──
+    # ── Coverage QA: check what fraction of ORIGINAL (unbuffered) AOI is covered
+    # Always measure against the original client AOI, not the buffer zone.
     coverage_pct = None
     try:
         if SHAPELY_AVAILABLE and raw_segments and line_spacing_m > 0:
+            # Use original polygon if available (pre-buffer), else use planning polygon
+            _check_poly = (aoi_payload.get("original_polygon") or polygon)
             half_w = line_spacing_m / 2.0
             strips = []
             for seg in raw_segments:
                 coords = list(seg.coords)
                 if len(coords) >= 2:
-                    # Buffer each segment by half line spacing to form a strip
-                    strips.append(seg.buffer(half_w, cap_style=2))  # flat caps
+                    strips.append(seg.buffer(half_w, cap_style=2))
             if strips:
                 covered = unary_union(strips)
-                # Rotate back to original orientation for comparison with polygon
                 covered_orig = shapely_rotate(
                     covered, -float(flight_azimuth_deg),
                     origin=polygon.centroid, use_radians=False
                 )
-                intersection_area = polygon.intersection(covered_orig).area
-                if polygon.area > 0:
-                    coverage_pct = round(100.0 * intersection_area / polygon.area, 1)
+                intersection_area = _check_poly.intersection(covered_orig).area
+                if _check_poly.area > 0:
+                    coverage_pct = round(100.0 * intersection_area / _check_poly.area, 1)
     except Exception:
         coverage_pct = None
 
