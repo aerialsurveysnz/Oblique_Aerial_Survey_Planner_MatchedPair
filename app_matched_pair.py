@@ -315,6 +315,29 @@ def _gh_config():
     return None
 
 
+def _gh_ensure_folder(token, repo, branch, folder, headers):
+    """Create folder on GitHub by pushing a .gitkeep file if it doesn't exist."""
+    import urllib.request, base64
+    gitkeep_url = f"https://api.github.com/repos/{repo}/contents/{folder}/.gitkeep"
+    try:
+        req = urllib.request.Request(gitkeep_url, headers=headers)
+        urllib.request.urlopen(req)  # already exists
+        return True
+    except Exception:
+        pass
+    try:
+        payload = json.dumps({
+            "message": "Create saved_scenarios folder",
+            "content": base64.b64encode(b"").decode(),
+            "branch": branch,
+        }).encode()
+        req = urllib.request.Request(gitkeep_url, data=payload, headers=headers, method="PUT")
+        urllib.request.urlopen(req)
+        return True
+    except Exception:
+        return False
+
+
 def _gh_push_scenario(name, json_text):
     """Push a scenario JSON file to GitHub. Returns (True, None) on success or (False, error_msg)."""
     cfg = _gh_config()
@@ -353,6 +376,16 @@ def _gh_push_scenario(name, json_text):
                     return False, f"GitHub returned HTTP {status}"
                 return True, None
         except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Folder probably doesn't exist — create it and retry
+                if _gh_ensure_folder(token, repo, branch, folder, headers):
+                    req2 = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+                    try:
+                        with urllib.request.urlopen(req2) as resp2:
+                            if resp2.status in (200, 201):
+                                return True, None
+                    except Exception as e2:
+                        return False, f"After folder create: {e2}"
             body = e.read().decode("utf-8", errors="replace")[:200]
             return False, f"HTTP {e.code}: {body}"
     except Exception as e:
@@ -3090,9 +3123,22 @@ if _gh_configured:
             if st.button("🧪 Test GitHub connection", key="test_gh_btn"):
                 _items = _gh_list_scenarios()
                 if _items:
-                    st.success(f"Found {len(_items)} file(s) on GitHub: {[n for n,_ in _items]}")
+                    st.success(f"Found {len(_items)} file(s): {[n for n,_ in _items]}")
                 else:
-                    st.error("No files returned — folder may be empty or token has no read access")
+                    st.warning("0 files — folder empty or unreadable")
+
+            if st.button("🔬 Test write access", key="test_write_btn"):
+                _ok, _err = _gh_push_scenario("_test_write_check", '{"test":true}')
+                if _ok:
+                    # Clean up test file
+                    _gh_delete_scenario("_test_write_check")
+                    st.success("✅ Write access confirmed! GitHub push works.")
+                else:
+                    cfg2 = _gh_config()
+                    if cfg2:
+                        t2, r2, b2, f2 = cfg2
+                        st.error(f"❌ Write failed: {_err}")
+                        st.code(f"URL tested: https://api.github.com/repos/{r2}/contents/{f2}/_test_write_check.json")
 else:
     st.sidebar.caption("⚠️ No GitHub sync — scenarios lost on reboot. Ask admin to configure GitHub secrets.")
 
@@ -3101,34 +3147,59 @@ if "scenario_flash_message" in st.session_state:
     flash_level = flash.get("level", "success")
     getattr(st.sidebar, flash_level, st.sidebar.success)(flash.get("text", "Scenario updated."))
 
+scenario_records = list_saved_scenarios()
+
 sc_name = st.sidebar.text_input("Scenario name", "my_survey")
+
+# Check if scenario already exists
+_sc_filename = sc_name if sc_name.endswith(".json") else f"{sc_name}.json"
+_sc_exists = (scenario_path_from_name(sc_name)).exists()
+
 if st.sidebar.button("Save scenario"):
-    _sc_data = {
-        "cameras": st.session_state.cameras,
-        "altitude_m": altitude_m,
-        "speed_ms": speed_ms,
-        "fwd_overlap_pct": fwd_pct,
-        "sidelap_pct": side_pct,
-        "reciprocal": reciprocal,
-    }
-    saved_path, _gh_ok, _gh_err = save_scenario(_sc_data, sc_name)
-    if _gh_ok:
-        _gh_msg = " and synced to GitHub ✓"
-        _flash_level = "success"
-    elif _gh_config() is None:
-        _gh_msg = " (local only — configure GitHub secrets to persist)"
-        _flash_level = "warning"
+    if _sc_exists and not st.session_state.get("confirm_overwrite_name") == sc_name:
+        # First click — ask for confirmation
+        st.session_state["confirm_overwrite_name"] = sc_name
+        st.rerun()
     else:
-        _gh_msg = f" — GitHub sync FAILED: {_gh_err}"
-        _flash_level = "error"
-    st.session_state.scenario_flash_message = {
-        "level": _flash_level,
-        "text": f"Saved {saved_path.name}{_gh_msg}",
-    }
-    st.session_state.selected_scenario_label = saved_path.name
-    st.session_state.saved_scenario_selector = saved_path.name
-    st.session_state.saved_scenario_selector_prev = saved_path.name
-    st.rerun()
+        # Either new scenario or confirmed overwrite
+        st.session_state.pop("confirm_overwrite_name", None)
+        _sc_data = {
+            "cameras": st.session_state.cameras,
+            "altitude_m": altitude_m,
+            "speed_ms": speed_ms,
+            "fwd_overlap_pct": fwd_pct,
+            "sidelap_pct": side_pct,
+            "reciprocal": reciprocal,
+        }
+        saved_path, _gh_ok, _gh_err = save_scenario(_sc_data, sc_name)
+        if _gh_ok:
+            _gh_msg = " and synced to GitHub ✓"
+            _flash_level = "success"
+        elif _gh_config() is None:
+            _gh_msg = " (local only — configure GitHub secrets to persist)"
+            _flash_level = "warning"
+        else:
+            _gh_msg = f" — GitHub sync FAILED: {_gh_err}"
+            _flash_level = "error"
+        st.session_state.scenario_flash_message = {
+            "level": _flash_level,
+            "text": f"Saved {saved_path.name}{_gh_msg}",
+        }
+        st.session_state.selected_scenario_label = saved_path.name
+        st.session_state.saved_scenario_selector = saved_path.name
+        st.session_state.saved_scenario_selector_prev = saved_path.name
+        st.rerun()
+
+# Overwrite confirmation prompt
+if st.session_state.get("confirm_overwrite_name") == sc_name:
+    st.sidebar.warning(f"⚠️ **'{sc_name}'** already exists. Overwrite?")
+    _col_yes, _col_no = st.sidebar.columns(2)
+    if _col_yes.button("✓ Yes, overwrite", key="confirm_overwrite_yes"):
+        st.session_state["confirm_overwrite_name"] = sc_name  # keep set so next Save proceeds
+        st.rerun()
+    if _col_no.button("✗ Cancel", key="confirm_overwrite_no"):
+        st.session_state.pop("confirm_overwrite_name", None)
+        st.rerun()
 
 scenario_records = list_saved_scenarios()
 scenario_labels = [record["label"] for record in scenario_records]
