@@ -2441,6 +2441,7 @@ def build_buffered_aoi(aoi_payload, buffer_m):
         if buffered.is_empty or not buffered.is_valid:
             return aoi_payload
         result = dict(aoi_payload)
+        result["original_polygon"] = poly          # preserve original BEFORE overwriting
         result["polygon"]  = buffered
         result["area_m2"]  = float(buffered.area)
         result["buffered_m"] = float(buffer_m)
@@ -2554,26 +2555,44 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         segs = list(iter_line_geometries(intersection))
         if not segs:
             continue
-        all_coords = []
-        for seg in segs:
-            all_coords.extend(list(seg.coords))
-        if len(all_coords) < 2:
-            continue
-        all_coords.sort(key=lambda c: c[1])
-        # Extend line ends by lead-in PLUS the max along-track footprint reach
-        # so that fore/aft oblique footprints always cover the AOI boundary
-        y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
-        y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
-        full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
-        seg_length = float(full_seg.length)
-        if seg_length <= 0:
-            continue
-        mission_length = seg_length
-        line_count += 1
-        total_line_length_m += mission_length
-        line_lengths_m.append(mission_length)
-        total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
-        raw_segments.append(full_seg)   # full unclipped segment
+        # Sort segments by y position
+        segs_sorted = sorted(segs, key=lambda s: list(s.coords)[0][1])
+        # Water gap threshold: if gap between segments > 3x line_spacing, split
+        # so we don't fly long stretches over open water
+        water_gap_threshold = line_spacing_m * 3.0
+
+        # Group consecutive segments that are close together
+        groups = []
+        current_group = [segs_sorted[0]]
+        for seg_i in segs_sorted[1:]:
+            prev_end   = max(c[1] for c in list(current_group[-1].coords))
+            this_start = min(c[1] for c in list(seg_i.coords))
+            if (this_start - prev_end) > water_gap_threshold:
+                groups.append(current_group)
+                current_group = [seg_i]
+            else:
+                current_group.append(seg_i)
+        groups.append(current_group)
+
+        # Create one flight line per group
+        for group in groups:
+            all_coords = []
+            for gs in group:
+                all_coords.extend(list(gs.coords))
+            if len(all_coords) < 2:
+                continue
+            all_coords.sort(key=lambda c: c[1])
+            y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
+            y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
+            full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
+            seg_length = float(full_seg.length)
+            if seg_length <= 0:
+                continue
+            line_count += 1
+            total_line_length_m += seg_length
+            line_lengths_m.append(seg_length)
+            total_exposures += max(1, int(math.ceil(seg_length / photo_spacing_m)) + 1)
+            raw_segments.append(full_seg)
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
@@ -2646,18 +2665,20 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "flight_azimuth_deg": float(flight_azimuth_deg),
         "lead_in_out_m": float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
-        "aoi_polygon": polygon,        # buffered polygon (for flight line clipping display)
-        "original_aoi_polygon": aoi_payload.get("polygon"),  # original unbuffered AOI
+        "aoi_polygon": polygon,        # buffered polygon used for flight line generation
+        "original_aoi_polygon": (aoi_payload.get("original_polygon")  # original pre-buffer
+                                 or aoi_payload.get("polygon")),       # fallback if no buffer
         # Geographic reference — passed through from aoi_payload so
         # make_aoi_mission_figure can fetch map tiles for the correct location.
-        "lon0":    aoi_payload.get("lon0"),
-        "lat0":    aoi_payload.get("lat0"),
-        "mx0":     aoi_payload.get("mx0"),
-        "my0":     aoi_payload.get("my0"),
-        "lon_min": aoi_payload.get("lon_min"),
-        "lon_max": aoi_payload.get("lon_max"),
-        "lat_min": aoi_payload.get("lat_min"),
-        "lat_max": aoi_payload.get("lat_max"),
+        "lon0":      aoi_payload.get("lon0"),
+        "lat0":      aoi_payload.get("lat0"),
+        "mx0":       aoi_payload.get("mx0"),
+        "my0":       aoi_payload.get("my0"),
+        "lon_min":   aoi_payload.get("lon_min"),
+        "lon_max":   aoi_payload.get("lon_max"),
+        "lat_min":   aoi_payload.get("lat_min"),
+        "lat_max":   aoi_payload.get("lat_max"),
+        "buffered_m": aoi_payload.get("buffered_m", 0.0),
     }
 
 
@@ -3039,16 +3060,41 @@ st.sidebar.markdown("---")
 _gh_configured = _gh_config() is not None
 st.sidebar.subheader("💾 Save / Load")
 if _gh_configured:
-    _sync_result = st.session_state.get("gh_sync_result", "")
-    if _sync_result.startswith("ok:"):
+    _sync_result = st.session_state.get("gh_sync_result", "not_run")
+    if _sync_result.startswith("ok:0"):
+        # Synced but got zero files — means GitHub folder is empty or fetch failed
+        st.sidebar.warning("☁️ GitHub connected but 0 scenarios found in repo. Check saved_scenarios folder exists.")
+    elif _sync_result.startswith("ok:"):
         _n = _sync_result.split(":")[1]
-        st.sidebar.caption(f"☁️ GitHub sync active — {_n} scenario(s) loaded from repo.")
-    elif _sync_result == "not_configured":
-        st.sidebar.caption("☁️ GitHub sync active.")
+        _extra = " ⚠️ some failed" if "failed" in _sync_result else ""
+        st.sidebar.caption(f"☁️ GitHub sync active — {_n} scenario(s) loaded.{_extra}")
+    elif _sync_result == "not_run":
+        st.sidebar.caption("☁️ GitHub sync active — syncing...")
     else:
-        st.sidebar.caption("☁️ GitHub sync active — scenarios persist across reboots.")
+        st.sidebar.caption("☁️ GitHub sync active.")
+
+    # Debug expander — shows exactly what happened
+    with st.sidebar.expander("🔍 Sync diagnostics"):
+        cfg = _gh_config()
+        if cfg:
+            token, repo, branch, folder = cfg
+            st.write(f"**Repo:** {repo}")
+            st.write(f"**Branch:** {branch}")
+            st.write(f"**Folder:** {folder}")
+            st.write(f"**Sync result:** {_sync_result}")
+            st.write(f"**Local scenarios:** {[p.name for p in SCENARIO_DIR.glob('*.json')] if SCENARIO_DIR.exists() else 'dir missing'}")
+            if st.button("🔄 Re-sync from GitHub", key="resync_btn"):
+                _sync_scenarios_from_github()
+                st.session_state.gh_scenarios_synced = True
+                st.rerun()
+            if st.button("🧪 Test GitHub connection", key="test_gh_btn"):
+                _items = _gh_list_scenarios()
+                if _items:
+                    st.success(f"Found {len(_items)} file(s) on GitHub: {[n for n,_ in _items]}")
+                else:
+                    st.error("No files returned — folder may be empty or token has no read access")
 else:
-    st.sidebar.caption("⚠️ No GitHub sync — scenarios are lost on app reboot. Ask admin to configure GitHub secrets.")
+    st.sidebar.caption("⚠️ No GitHub sync — scenarios lost on reboot. Ask admin to configure GitHub secrets.")
 
 if "scenario_flash_message" in st.session_state:
     flash = st.session_state.pop("scenario_flash_message")
