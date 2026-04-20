@@ -39,12 +39,9 @@ Run:
 import json
 import html
 import math
-import os
-import base64
 from dataclasses import replace
 from pathlib import Path
 import io
-from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
 from datetime import datetime
 from itertools import product
 from xml.etree import ElementTree as ET
@@ -284,226 +281,228 @@ def normalise_scenario_name(name):
     return cleaned or "my_survey"
 
 
-def scenario_filename(name):
+def scenario_path_from_name(name):
     safe_name = normalise_scenario_name(name)
     if not safe_name.lower().endswith(".json"):
         safe_name = f"{safe_name}.json"
-    return safe_name
-
-
-def scenario_path_from_name(name):
-    return ensure_scenario_dir() / scenario_filename(name)
+    return ensure_scenario_dir() / safe_name
 
 
 def is_scenario_payload(data):
     return isinstance(data, dict) and isinstance(data.get("cameras"), list)
 
 
-def _read_secret(*path_parts):
-    env_key = "_".join(str(part).upper() for part in path_parts if str(part).strip())
-    env_val = os.getenv(env_key)
-    if env_val not in (None, ""):
-        return str(env_val)
+def save_scenario(data, name):
+    path = scenario_path_from_name(name)
+    json_text = json.dumps(data, indent=2, default=str)
+    path.write_text(json_text)
+    gh_ok, gh_err = _gh_push_scenario(name, json_text)
+    return path, gh_ok, gh_err
 
+
+def _gh_config():
+    """Return (token, repo, branch, folder) from st.secrets, or None if not set."""
     try:
-        current = st.secrets
-        for part in path_parts:
-            current = current[part]
-        if current not in (None, ""):
-            return str(current)
+        sec = st.secrets.get("github", {})
+        token  = sec.get("token")
+        repo   = sec.get("repo")
+        branch = sec.get("branch", "main")
+        folder = sec.get("scenarios_folder", "saved_scenarios")
+        if token and repo:
+            return token, repo, branch, folder
     except Exception:
         pass
-
-    try:
-        flat_key = ".".join(str(part) for part in path_parts if str(part).strip())
-        current = st.secrets.get(flat_key)
-        if current not in (None, ""):
-            return str(current)
-    except Exception:
-        pass
-
     return None
 
 
-def github_storage_config():
-    token = _read_secret("github", "token") or _read_secret("GITHUB_TOKEN")
-    repo = _read_secret("github", "repo") or _read_secret("GITHUB_REPO")
-    owner = _read_secret("github", "owner") or _read_secret("GITHUB_REPO_OWNER")
-    name = _read_secret("github", "name") or _read_secret("GITHUB_REPO_NAME")
-    branch = (_read_secret("github", "branch") or _read_secret("GITHUB_BRANCH") or "main").strip()
-    scenario_path = (_read_secret("github", "scenario_path") or _read_secret("GITHUB_SCENARIO_PATH") or "saved_scenarios").strip(" /")
-
-    if repo and "/" in repo and (not owner or not name):
-        owner, name = repo.split("/", 1)
-
-    owner = (owner or "").strip()
-    name = (name or "").strip()
-    token = (token or "").strip()
-
-    return {
-        "token": token,
-        "owner": owner,
-        "name": name,
-        "branch": branch or "main",
-        "scenario_path": scenario_path or "saved_scenarios",
-        "enabled": bool(token and owner and name),
-    }
-
-
-def github_storage_status():
-    cfg = github_storage_config()
-    if cfg["enabled"]:
-        return {
-            "mode": "github",
-            "summary": f"GitHub repo {cfg['owner']}/{cfg['name']} @ {cfg['branch']}:{cfg['scenario_path']}",
-        }
-
-    missing = []
-    if not cfg["token"]:
-        missing.append("token")
-    if not cfg["owner"] and not cfg["name"]:
-        missing.append("repo")
-    elif not cfg["owner"]:
-        missing.append("owner")
-    elif not cfg["name"]:
-        missing.append("repo name")
-
-    summary = "Local app folder only"
-    if missing:
-        summary += f" — missing GitHub {'/'.join(missing)} secret(s)"
-    return {"mode": "local", "summary": summary}
-
-
-def _github_contents_path(name_or_relpath, cfg=None):
-    cfg = cfg or github_storage_config()
-    rel = str(name_or_relpath or "").strip("/")
-    if rel.startswith(cfg["scenario_path"].strip("/") + "/"):
-        return rel
-    if "/" not in rel or rel.lower().endswith(".json"):
-        rel = scenario_filename(Path(rel).name)
-        rel = f"{cfg['scenario_path'].strip('/')}/{rel}"
-    return rel.strip("/")
-
-
-def _github_api_request(method, api_path, cfg=None, payload=None):
-    cfg = cfg or github_storage_config()
-    url = f"https://api.github.com{api_path}"
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "oblique-survey-planner",
-    }
-    if cfg.get("token"):
-        headers["Authorization"] = f"Bearer {cfg['token']}"
-
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    req = urllib_request.Request(url, data=data, headers=headers, method=method)
+def _gh_ensure_folder(token, repo, branch, folder, headers):
+    """Create folder on GitHub by pushing a .gitkeep file if it doesn't exist."""
+    import urllib.request, base64
+    gitkeep_url = f"https://api.github.com/repos/{repo}/contents/{folder}/.gitkeep"
     try:
-        with urllib_request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
-            if not raw:
-                return resp.status, None
-            return resp.status, json.loads(raw.decode("utf-8"))
-    except urllib_error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body) if body else {}
-        except Exception:
-            parsed = {"message": body}
-        parsed.setdefault("message", body or f"HTTP {exc.code}")
-        return exc.code, parsed
+        req = urllib.request.Request(gitkeep_url, headers=headers)
+        urllib.request.urlopen(req)  # already exists
+        return True
+    except Exception:
+        pass
+    try:
+        payload = json.dumps({
+            "message": "Create saved_scenarios folder",
+            "content": base64.b64encode(b"").decode(),
+            "branch": branch,
+        }).encode()
+        req = urllib.request.Request(gitkeep_url, data=payload, headers=headers, method="PUT")
+        urllib.request.urlopen(req)
+        return True
+    except Exception:
+        return False
 
 
-def _github_get_json_file(relpath, cfg=None):
-    cfg = cfg or github_storage_config()
-    api_relpath = urllib_parse.quote(str(relpath).strip("/"), safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{api_relpath}?ref={urllib_parse.quote(cfg['branch'])}"
-    status, payload = _github_api_request("GET", api_path, cfg=cfg)
-    if status == 404:
-        return None
-    if status >= 300:
-        raise RuntimeError(payload.get("message", f"GitHub read failed ({status})"))
-
-    if isinstance(payload, dict) and payload.get("encoding") == "base64":
-        decoded = base64.b64decode(payload.get("content", "").encode("utf-8")).decode("utf-8")
-        data = json.loads(decoded)
-        return {
-            "data": data,
-            "sha": payload.get("sha"),
-            "path": payload.get("path", relpath),
-            "name": payload.get("name", Path(relpath).name),
+def _gh_push_scenario(name, json_text):
+    """Push a scenario JSON file to GitHub. Returns (True, None) on success or (False, error_msg)."""
+    cfg = _gh_config()
+    if cfg is None:
+        return False, "GitHub not configured"
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request, base64
+        filename = name if name.endswith(".json") else f"{name}.json"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}/{filename}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
         }
-
-    raise RuntimeError("Unexpected response while reading the scenario from GitHub.")
-
-
-def save_scenario_local(data, name):
-    path = scenario_path_from_name(name)
-    path.write_text(json.dumps(data, indent=2, default=str))
-    return path
-
-
-def save_scenario_github(data, name):
-    cfg = github_storage_config()
-    if not cfg["enabled"]:
-        raise RuntimeError("GitHub storage is not configured. Add GITHUB_TOKEN and repo details in Streamlit secrets.")
-
-    relpath = _github_contents_path(name, cfg=cfg)
-    existing = _github_get_json_file(relpath, cfg=cfg)
-
-    payload = dict(data)
-    payload.setdefault("saved_at_utc", datetime.utcnow().replace(microsecond=0).isoformat() + "Z")
-    encoded = base64.b64encode(json.dumps(payload, indent=2, default=str).encode("utf-8")).decode("utf-8")
-    api_relpath = urllib_parse.quote(relpath, safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{api_relpath}"
-    body = {
-        "message": f"Save scenario {Path(relpath).name}",
-        "content": encoded,
-        "branch": cfg["branch"],
-    }
-    if existing and existing.get("sha"):
-        body["sha"] = existing["sha"]
-
-    status, response = _github_api_request("PUT", api_path, cfg=cfg, payload=body)
-    if status >= 300:
-        raise RuntimeError(response.get("message", f"GitHub save failed ({status})"))
-
-    content = (response or {}).get("content") or {}
-    return {
-        "label": content.get("name", Path(relpath).name),
-        "path": f"github:{relpath}",
-        "origin": "github",
-        "saved_to": f"{cfg['owner']}/{cfg['name']}:{relpath}",
-        "branch": cfg["branch"],
-    }
-
-
-def save_scenario(data, name):
-    local_path = save_scenario_local(data, name)
-    cfg = github_storage_config()
-    if cfg["enabled"]:
+        sha = None
+        req = urllib.request.Request(api_url, headers=headers)
         try:
-            record = save_scenario_github(data, name)
-            record["local_backup"] = str(local_path)
-            return record
-        except Exception as exc:
-            raise RuntimeError(
-                f"Saved a local backup to {local_path.as_posix()}, but GitHub sync failed: {exc}"
-            ) from exc
+            with urllib.request.urlopen(req) as resp:
+                sha = json.loads(resp.read()).get("sha")
+        except Exception:
+            pass
+        payload = {
+            "message": f"Save scenario: {filename}",
+            "content": base64.b64encode(json_text.encode()).decode(),
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                status = resp.status
+                if status not in (200, 201):
+                    return False, f"GitHub returned HTTP {status}"
+                return True, None
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                # Folder probably doesn't exist — create it and retry
+                if _gh_ensure_folder(token, repo, branch, folder, headers):
+                    req2 = urllib.request.Request(api_url, data=data, headers=headers, method="PUT")
+                    try:
+                        with urllib.request.urlopen(req2) as resp2:
+                            if resp2.status in (200, 201):
+                                return True, None
+                    except Exception as e2:
+                        return False, f"After folder create: {e2}"
+            body = e.read().decode("utf-8", errors="replace")[:200]
+            return False, f"HTTP {e.code}: {body}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
-    return {
-        "label": local_path.name,
-        "path": str(local_path),
-        "origin": "saved_scenarios",
-        "saved_to": local_path.parent.as_posix(),
-    }
+
+def _gh_list_scenarios():
+    """List scenario files from GitHub using contents API.
+    Returns list of (name, json_text). Each file fetched via its download_url.
+    Returns [] on any failure.
+    """
+    cfg = _gh_config()
+    if cfg is None:
+        return []
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request
+        # Get directory listing
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            items = json.loads(resp.read())
+        if not isinstance(items, list):
+            return []
+        results = []
+        for item in items:
+            if not item.get("name", "").endswith(".json"):
+                continue
+            # Use raw_url (unauthenticated) or download_url — faster than API
+            dl_url = item.get("download_url") or item.get("html_url")
+            if not dl_url:
+                continue
+            try:
+                req2 = urllib.request.Request(
+                    dl_url,
+                    headers={"Authorization": f"token {token}"}
+                )
+                with urllib.request.urlopen(req2, timeout=10) as r:
+                    results.append((item["name"], r.read().decode("utf-8")))
+            except Exception:
+                continue  # skip individual file failures, keep going
+        return results
+    except Exception:
+        return []
 
 
-def load_scenario_local(path_or_name):
+def _sync_scenarios_from_github():
+    """Pull ALL scenario files from GitHub into local SCENARIO_DIR.
+    Called once per session on startup. Stores sync result in session state
+    so the sidebar can show whether sync succeeded.
+    """
+    cfg = _gh_config()
+    if cfg is None:
+        st.session_state["gh_sync_result"] = "not_configured"
+        return
+    ensure_scenario_dir()
+    synced = 0
+    failed = 0
+    for filename, json_text in _gh_list_scenarios():
+        local_path = SCENARIO_DIR / filename
+        try:
+            data = json.loads(json_text)
+            if is_scenario_payload(data):
+                local_path.write_text(json_text, encoding="utf-8")
+                synced += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+    st.session_state["gh_sync_result"] = f"ok:{synced}"
+    if failed:
+        st.session_state["gh_sync_result"] += f":failed:{failed}"
+
+
+def _gh_delete_scenario(name):
+    """Delete a scenario from GitHub. Silent on failure."""
+    cfg = _gh_config()
+    if cfg is None:
+        return False
+    token, repo, branch, folder = cfg
+    try:
+        import urllib.request
+        filename = name if name.endswith(".json") else f"{name}.json"
+        api_url = f"https://api.github.com/repos/{repo}/contents/{folder}/{filename}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+        }
+        # Get SHA first
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            sha = json.loads(resp.read()).get("sha")
+        payload = json.dumps({"message": f"Delete scenario: {filename}", "sha": sha, "branch": branch}).encode()
+        req = urllib.request.Request(api_url, data=payload, headers=headers, method="DELETE")
+        with urllib.request.urlopen(req):
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def delete_scenario(name):
+    """Delete a scenario locally and from GitHub."""
+    path = scenario_path_from_name(name)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    _gh_delete_scenario(name)
+
+
+def load_scenario(path_or_name):
     candidate = Path(path_or_name)
     possible_paths = []
     if candidate.exists():
@@ -525,37 +524,7 @@ def load_scenario_local(path_or_name):
     return None
 
 
-def load_scenario(path_or_name):
-    raw = str(path_or_name or "")
-    if raw.startswith("github:"):
-        relpath = raw.split(":", 1)[1]
-        try:
-            file_obj = _github_get_json_file(relpath)
-            data = (file_obj or {}).get("data")
-            if is_scenario_payload(data):
-                return data
-        except Exception:
-            return None
-        return None
-
-    data = load_scenario_local(path_or_name)
-    if data is not None:
-        return data
-
-    cfg = github_storage_config()
-    if cfg["enabled"]:
-        try:
-            relpath = _github_contents_path(path_or_name, cfg=cfg)
-            file_obj = _github_get_json_file(relpath, cfg=cfg)
-            data = (file_obj or {}).get("data")
-            if is_scenario_payload(data):
-                return data
-        except Exception:
-            return None
-    return None
-
-
-def list_saved_scenarios_local():
+def list_saved_scenarios():
     ensure_scenario_dir()
     found = []
     seen = set()
@@ -581,59 +550,6 @@ def list_saved_scenarios_local():
         if path.name == PRESET_FILE.name:
             continue
         _append(path, "project_root")
-
-    return found
-
-
-def list_saved_scenarios_github():
-    cfg = github_storage_config()
-    if not cfg["enabled"]:
-        return []
-
-    relpath = urllib_parse.quote(cfg["scenario_path"], safe="/")
-    api_path = f"/repos/{urllib_parse.quote(cfg['owner'])}/{urllib_parse.quote(cfg['name'])}/contents/{relpath}?ref={urllib_parse.quote(cfg['branch'])}"
-    status, payload = _github_api_request("GET", api_path, cfg=cfg)
-    if status == 404:
-        return []
-    if status >= 300:
-        raise RuntimeError(payload.get("message", f"GitHub list failed ({status})"))
-
-    found = []
-    for item in payload or []:
-        if item.get("type") != "file":
-            continue
-        name = str(item.get("name", ""))
-        if not name.lower().endswith(".json"):
-            continue
-        found.append({
-            "label": name,
-            "path": f"github:{item.get('path', '')}",
-            "origin": "github",
-            "saved_to": f"{cfg['owner']}/{cfg['name']}:{item.get('path', '')}",
-        })
-    return sorted(found, key=lambda item: item["label"].lower())
-
-
-def list_saved_scenarios():
-    found = []
-    seen_labels = set()
-
-    try:
-        for record in list_saved_scenarios_github():
-            key = record["label"].lower()
-            if key in seen_labels:
-                continue
-            seen_labels.add(key)
-            found.append(record)
-    except Exception as exc:
-        st.sidebar.warning(f"GitHub scenario list unavailable: {exc}")
-
-    for record in list_saved_scenarios_local():
-        key = record["label"].replace(" (project root)", "").lower()
-        if key in seen_labels and record.get("origin") != "project_root":
-            continue
-        seen_labels.add(key)
-        found.append(record)
 
     return found
 
@@ -780,7 +696,7 @@ def set_table_style(table, style_name):
         pass
 
 
-def fig_to_png_bytes(fig, dpi=180):
+def fig_to_png_bytes(fig, dpi=120):
     bio = io.BytesIO()
     fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", facecolor=fig.get_facecolor())
     bio.seek(0)
@@ -822,52 +738,379 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Average storage per image", f"{storage_per_image_mb:.1f} MB/image"],
         ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
+        ["Flight strip coverage", f"{mission_outputs.get('coverage_pct', '—')}%" if mission_outputs.get('coverage_pct') is not None else "—"],
+        ["Airborne time", f"{float(mission_outputs.get('airborne_time_s', 0.0)) / 3600.0:.2f} hr"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
-        ["Estimated flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr"],
+        ["Total flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr (airborne + turns)"],
     ]
 
 
+def make_kml_export(mission_outputs, solutions=None):
+    """KML export with 4 top-level folders:
+      1. Flight Lines
+      2. Trigger Points  (all cameras combined)
+      3. Frame Coverage  (all cameras combined — unioned footprint per trigger)
+      4. AOI Boundary
+    Plus optional per-camera sub-folders inside Trigger Points and Frame Coverage.
+    """
+    if mission_outputs is None:
+        return None
+    mx0 = mission_outputs.get("mx0")
+    my0 = mission_outputs.get("my0")
+    if mx0 is None or my0 is None:
+        return None
+
+    import math as _m
+    _R = 6378137.0
+
+    def _wgs84(lx, ly):
+        lon = _m.degrees((mx0 + lx) / _R)
+        lat = _m.degrees(2 * _m.atan(_m.exp((my0 + ly) / _R)) - _m.pi / 2)
+        return lon, lat
+
+    def _cs(pts):
+        return " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in pts)
+
+    def _poly_pm(style_id, corners, folder=''):
+        """Return a KML Placemark string for a polygon (corners in local offsets)."""
+        cl = corners + [corners[0]]
+        cs = " ".join(f"{_wgs84(x,y)[0]:.8f},{_wgs84(x,y)[1]:.8f},0" for x, y in cl)
+        ed = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{folder}</SimpleData></SchemaData></ExtendedData>' if folder else ''
+        return f'    <Placemark><styleUrl>#{style_id}</styleUrl>' + ed + f'<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{cs}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>'
+
+    def _pt_pm(style_id, lx, ly, folder=''):
+        lo, la = _wgs84(lx, ly)
+        ed = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{folder}</SimpleData></SchemaData></ExtendedData>' if folder else ''
+        return f'    <Placemark><styleUrl>#{style_id}</styleUrl>' + ed + f'<Point><coordinates>{lo:.8f},{la:.8f},0</coordinates></Point></Placemark>'
+
+    name       = mission_outputs.get("name", "AOI")
+    azimuth    = float(mission_outputs.get("flight_azimuth_deg", 0.0))
+    line_count = int(mission_outputs.get("line_count", 0))
+    line_sp    = float(mission_outputs.get("line_spacing_m", 0.0))
+    photo_sp   = float(mission_outputs.get("photo_spacing_m", 0.0))
+    total_km   = float(mission_outputs.get("total_line_length_m", 0.0)) / 1000.0
+    fly_hr     = float(mission_outputs.get("flight_time_s", 0.0)) / 3600.0
+    cov_pct    = mission_outputs.get("coverage_pct")
+    cov_str    = f"{cov_pct:.1f}%" if cov_pct is not None else "n/a"
+    buf_m      = float(mission_outputs.get("buffered_m", 0.0)) if mission_outputs.get("buffered_m") else 0.0
+    buf_str    = f"{buf_m:.0f} m" if buf_m > 0 else "none"
+
+    mission_lines = mission_outputs.get("mission_line_geometries", [])
+    aoi_poly      = (mission_outputs.get("original_aoi_polygon")
+                   or mission_outputs.get("aoi_polygon"))  # prefer original unbuffered
+
+    # KML colours: AABBGGRR
+    _cam_cols = {
+        "nadir":   ("ff00ffff", "1800ffff"),
+        "right":   ("ff0000ff", "180000ff"),
+        "left":    ("ff00cc00", "1800cc00"),
+        "fore":    ("ffff00ff", "18ff00ff"),
+        "aft":     ("ff00ccff", "1800ccff"),
+        "default": ("ffffffff", "18ffffff"),
+    }
+    def _ccol(label):
+        lbl = (label or "").lower()
+        for k in ("nadir","right","left","fore","aft"):
+            if k in lbl: return _cam_cols[k]
+        return _cam_cols["default"]
+
+    # Collect per-camera footprint corners
+    cam_data = []  # list of (label, sid, line_col, fill_col, fp_corners)
+    if solutions:
+        for _cam, _sol, _ in solutions:
+            lbl = _sol.label or "Camera"
+            sid = lbl.replace(" ", "_")
+            lc, fc = _ccol(lbl)
+            try:
+                corners = camera_polygon(_sol)
+                if not corners or not all(_m.isfinite(v) for xy in corners for v in xy):
+                    corners = None
+            except Exception:
+                corners = None
+            cam_data.append((lbl, sid, lc, fc, corners))
+
+    # ── Build KML ─────────────────────────────────────────────────────────────
+    out = []
+    out.append('''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>''')
+    out.append(f'''  <name>{name} — Flight Plan</name>
+  <description>AOI: {name} | Azimuth: {azimuth:.1f}° | Lines: {line_count} | Line spacing: {line_sp:.0f} m | Photo spacing: {photo_sp:.0f} m | Total length: {total_km:.1f} km | Flying time: {fly_hr:.2f} hr | Strip coverage: {cov_str} | Coverage buffer: {buf_str}</description>''')
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    out.append('''  <Style id="fl_odd"><LineStyle><color>fff0c040</color><width>2</width></LineStyle></Style>
+  <Style id="fl_even"><LineStyle><color>ff40c0f0</color><width>2</width></LineStyle></Style>
+  <Style id="aoi"><LineStyle><color>ff4444ff</color><width>3</width></LineStyle><PolyStyle><color>224444ff</color></PolyStyle></Style>
+  <Style id="pt_all"><IconStyle><color>ffffffff</color><scale>0.45</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle><LabelStyle><scale>0</scale></LabelStyle></Style>
+  <Style id="fp_all"><LineStyle><color>aaffffff</color><width>1</width></LineStyle><PolyStyle><color>0cffffff</color></PolyStyle></Style>''')
+
+    # Per-camera styles
+    for lbl, sid, lc, fc, _ in cam_data:
+        out.append(f'''  <Style id="pt_{sid}"><IconStyle><color>{lc}</color><scale>0.45</scale><Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle><LabelStyle><scale>0</scale></LabelStyle></Style>
+  <Style id="fp_{sid}"><LineStyle><color>{lc}</color><width>1</width></LineStyle><PolyStyle><color>{fc}</color></PolyStyle></Style>''')
+
+    # ── 1. FLIGHT LINES ───────────────────────────────────────────────────────
+    if mission_lines:
+        out.append('''  <Folder>
+    <name>1. Flight Lines</name>
+    <visibility>1</visibility>''')
+        for idx, lg in enumerate(mission_lines, 1):
+            try:
+                coords = list(lg.coords)
+                if len(coords) < 2: continue
+                cs = _cs(coords)
+                sty = "fl_odd" if idx % 2 == 1 else "fl_even"
+                out.append(f'''    <Placemark><name>Line {idx}</name><styleUrl>#{sty}</styleUrl>
+      <ExtendedData><SchemaData><SimpleData name="KML_FOLDER">1. Flight Lines</SimpleData></SchemaData></ExtendedData><LineString><tessellate>1</tessellate><coordinates>{cs}</coordinates></LineString>
+    </Placemark>''')
+            except Exception:
+                continue
+        out.append('''  </Folder>''')
+
+    # ── Build trigger positions per line (shared between folders 2 & 3) ───────
+    trigger_positions = []  # list of (cx, cy, ux, uy, ax, ay) per trigger
+    if mission_lines and photo_sp > 0:
+        import math as _m2
+        for lg in mission_lines:
+            try:
+                lc2 = list(lg.coords)
+                if len(lc2) < 2: continue
+                x0,y0 = lc2[0]; x1,y1 = lc2[-1]
+                seg = _m2.hypot(x1-x0, y1-y0)
+                if seg < 1: continue
+                ux,uy = (x1-x0)/seg, (y1-y0)/seg
+                ax,ay = -uy, ux
+                n = max(1, int(_m2.ceil(seg/photo_sp)) + 1)
+                for i in range(n):
+                    t = min(i*photo_sp, seg)
+                    trigger_positions.append((x0+ux*t, y0+uy*t, ux, uy, ax, ay))
+            except Exception:
+                continue
+
+    # ── 2. TRIGGER POINTS ─────────────────────────────────────────────────────
+    if trigger_positions:
+        out.append('''  <Folder>
+    <name>2. Trigger Points</name>
+    <visibility>1</visibility>
+    <description>One point per trigger event — all cameras fire simultaneously</description>''')
+
+        # Combined (all cameras) — always visible
+        out.append('''    <Folder><name>All cameras combined</name><visibility>1</visibility>''')
+        for cx,cy,*_ in trigger_positions:
+            out.append(_pt_pm("pt_all", cx, cy, "2. Trigger Points"))
+        out.append('''    </Folder>''')
+
+        # Per-camera sub-folders — collapsed by default
+        for lbl, sid, lc, fc, _ in cam_data:
+            out.append(f'''    <Folder><name>{lbl}</name><visibility>0</visibility>''')
+            for cx,cy,*_ in trigger_positions:
+                out.append(_pt_pm(f"pt_{sid}", cx, cy))
+            out.append('''    </Folder>''')
+
+        out.append('''  </Folder>''')
+
+    # ── 3. FRAME COVERAGE ─────────────────────────────────────────────────────
+    if trigger_positions and cam_data:
+        out.append('''  <Folder>
+    <name>3. Frame Coverage</name>
+    <visibility>1</visibility>
+    <description>Ground footprint of each camera frame</description>''')
+
+        # Combined footprint (union colour) — show all cameras together
+        out.append('''    <Folder><name>All cameras combined</name><visibility>1</visibility>''')
+        for cx,cy,ux,uy,ax,ay in trigger_positions:
+            for lbl, sid, lc, fc, corners in cam_data:
+                if not corners: continue
+                try:
+                    rot = [(cx + fcx*ax + fcy*ux, cy + fcx*ay + fcy*uy)
+                           for fcx,fcy in corners]
+                    out.append(_poly_pm("fp_all", rot, "3. Frame Coverage"))
+                except Exception:
+                    continue
+        out.append('''    </Folder>''')
+
+        # Per-camera sub-folders — collapsed by default
+        for lbl, sid, lc, fc, corners in cam_data:
+            if not corners: continue
+            out.append(f'''    <Folder><name>{lbl}</name><visibility>0</visibility>''')
+            for cx,cy,ux,uy,ax,ay in trigger_positions:
+                try:
+                    rot = [(cx + fcx*ax + fcy*ux, cy + fcx*ay + fcy*uy)
+                           for fcx,fcy in corners]
+                    out.append(_poly_pm(f"fp_{sid}", rot))
+                except Exception:
+                    continue
+            out.append('''    </Folder>''')
+
+        out.append('''  </Folder>''')
+
+    # ── 4. AOI BOUNDARY ───────────────────────────────────────────────────────
+    # ── 4. AOI BOUNDARY (original, unbuffered) ────────────────────────────────
+    if aoi_poly is not None and not getattr(aoi_poly, "is_empty", True):
+        out.append('  <Folder>\n    <n>4. AOI Boundary</n>\n    <visibility>1</visibility>\n    <description>Original AOI boundary as loaded from KML</description>')
+        geoms = ([aoi_poly] if getattr(aoi_poly,"geom_type","") == "Polygon"
+                 else list(getattr(aoi_poly,"geoms",[])))
+        ed_aoi = '<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">4. AOI Boundary</SimpleData></SchemaData></ExtendedData>'
+        for geom in geoms:
+            if getattr(geom,"is_empty",True): continue
+            outer_str = _cs(list(geom.exterior.coords))
+            pm = f'    <Placemark><n>AOI Boundary</n><styleUrl>#aoi</styleUrl>{ed_aoi}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{outer_str}</coordinates></LinearRing></outerBoundaryIs>'
+            for interior in getattr(geom,"interiors",[]):
+                istr = _cs(list(interior.coords))
+                pm += f'<innerBoundaryIs><LinearRing><coordinates>{istr}</coordinates></LinearRing></innerBoundaryIs>'
+            pm += '</Polygon></Placemark>'
+            out.append(pm)
+        out.append('  </Folder>')
+
+    # ── 4b. FLIGHT PLANNING BOUNDARY (buffered AOI) ────────────────────────────
+    # Always exported — if no buffer it equals the AOI boundary
+    buffered_poly = mission_outputs.get("aoi_polygon")
+    if buffered_poly is not None and not getattr(buffered_poly,"is_empty",True):
+        _buf_label = f"4b. Flight Planning Boundary (+{buf_m:.0f} m buffer)" if buf_m > 0 else "4b. Flight Planning Boundary (no buffer)"
+        _buf_desc  = (f"AOI expanded by {buf_m:.0f} m coverage buffer — flight lines cover this area"
+                      if buf_m > 0 else "No buffer applied")
+        out.append(f'  <Folder>\n    <n>{_buf_label}</n>\n    <visibility>1</visibility>\n    <description>{_buf_desc}</description>\n  <Style id="buf"><LineStyle><color>ff44ffff</color><width>2.5</width></LineStyle><PolyStyle><color>1044ffff</color></PolyStyle></Style>')
+        bgeoms = ([buffered_poly] if getattr(buffered_poly,"geom_type","") == "Polygon"
+                  else list(getattr(buffered_poly,"geoms",[])))
+        ed_buf = f'<ExtendedData><SchemaData><SimpleData name="KML_FOLDER">{_buf_label}</SimpleData></SchemaData></ExtendedData>'
+        for bgeom in bgeoms:
+            if getattr(bgeom,"is_empty",True): continue
+            bouter = _cs(list(bgeom.exterior.coords))
+            out.append(f'    <Placemark><n>{_buf_label}</n><styleUrl>#buf</styleUrl>{ed_buf}<Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>{bouter}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>')
+        out.append('  </Folder>')
+
+    out.append('''</Document>
+</kml>''')
+    return "\n".join(out).encode("utf-8")
+
+
 def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None):
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
+    from openpyxl.utils import get_column_letter
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    C_HEADER_BG  = "1F4E79"   # dark blue header
+    C_HEADER_FG  = "FFFFFF"   # white header text
+    C_SUBHDR_BG  = "D6E4F0"   # pale blue subheader
+    C_SUBHDR_FG  = "1F4E79"   # dark blue subheader text
+    C_ROW_ALT    = "EBF3FB"   # alternating row tint
+    C_BORDER     = "BFBFBF"   # light grey border
+
+    thin  = Side(style="thin",   color=C_BORDER)
+    thick = Side(style="medium", color="1F4E79")
+    bdr_cell  = Border(left=thin,  right=thin,  top=thin,  bottom=thin)
+    bdr_outer = Border(left=thick, right=thick, top=thick, bottom=thick)
+
+    def hdr_font(sz=10):  return Font(name="Arial", bold=True, color=C_HEADER_FG, size=sz)
+    def sub_font(sz=10):  return Font(name="Arial", bold=True, color=C_SUBHDR_FG, size=sz)
+    def body_font(sz=10): return Font(name="Arial", size=sz)
+    def hdr_fill():       return PatternFill("solid", fgColor=C_HEADER_BG)
+    def alt_fill():       return PatternFill("solid", fgColor=C_ROW_ALT)
+    def sub_fill():       return PatternFill("solid", fgColor=C_SUBHDR_BG)
+    def wrap_align():     return Alignment(wrap_text=True, vertical="center")
+    def ctr_align():      return Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def style_header_row(ws, row_num, ncols):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=row_num, column=c)
+            cell.font  = hdr_font()
+            cell.fill  = hdr_fill()
+            cell.alignment = ctr_align()
+            cell.border = bdr_cell
+
+    def style_data_rows(ws, start_row, end_row, ncols):
+        for r in range(start_row, end_row + 1):
+            use_alt = (r - start_row) % 2 == 1
+            for c in range(1, ncols + 1):
+                cell = ws.cell(row=r, column=c)
+                cell.font      = body_font()
+                cell.alignment = wrap_align()
+                cell.border    = bdr_cell
+                if use_alt:
+                    cell.fill = alt_fill()
+
+    def auto_col_width(ws, min_w=12, max_w=50):
+        for col in ws.columns:
+            best = min_w
+            for cell in col:
+                if cell.value:
+                    best = max(best, min(max_w, len(str(cell.value)) + 4))
+            ws.column_dimensions[get_column_letter(col[0].column)].width = best
+
+    def sheet_title(ws, title):
+        ws.sheet_view.showGridLines = False
+        ws.row_dimensions[1].height = 22
+        cell = ws.cell(row=1, column=1, value=title)
+        cell.font      = Font(name="Arial", bold=True, size=13, color=C_HEADER_FG)
+        cell.fill      = hdr_fill()
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
     wb = Workbook()
 
+    # ── Sheet 1: Settings ─────────────────────────────────────────────────────
     ws1 = wb.active
     ws1.title = "Settings"
-    for row in settings_rows:
-        ws1.append(row)
+    sheet_title(ws1, "Survey Settings")
+    ws1.append([])  # blank row 2
+    ws1.append(["Parameter", "Value"])
+    style_header_row(ws1, 3, 2)
+    for i, row in enumerate(settings_rows):
+        ws1.append(list(row))
+        style_data_rows(ws1, 4 + i, 4 + i, 2)
+    ws1.merge_cells("A1:B1")
+    auto_col_width(ws1)
+    ws1.freeze_panes = "A4"
 
+    # ── Sheet 2: System Summary ───────────────────────────────────────────────
     ws2 = wb.create_sheet("System Summary")
-    for row in system_rows:
-        ws2.append(row)
+    sheet_title(ws2, "System Summary")
+    ws2.append([])
+    ws2.append(["Metric", "Value"])
+    style_header_row(ws2, 3, 2)
+    for i, row in enumerate(system_rows):
+        ws2.append(list(row))
+        style_data_rows(ws2, 4 + i, 4 + i, 2)
+    ws2.merge_cells("A1:B1")
+    auto_col_width(ws2)
+    ws2.freeze_panes = "A4"
 
+    # ── Sheet 3: Camera Results ───────────────────────────────────────────────
     ws3 = wb.create_sheet("Camera Results")
-    ws3.append([
-        "Camera",
-        "Inner edge oblique (deg)",
-        "Outer edge oblique (deg)",
-        "Near angle (deg)",
-        "Near class",
-        "Far angle (deg)",
-        "Far class",
-        "Inner GSD (cm/px)",
-        "Centre GSD (cm/px)",
-        "Outer GSD (cm/px)",
-        "Inner edge (m)",
-        "Centre (m)",
-        "Outer edge (m)",
-    ])
+    sheet_title(ws3, "Per-Camera Results")
+    ws3.append([])
+    headers3 = [
+        "Camera", "Inner oblique (°)", "Outer oblique (°)",
+        "Near angle (°)", "Near class", "Far angle (°)", "Far class",
+        "Inner GSD (cm/px)", "Centre GSD (cm/px)", "Outer GSD (cm/px)",
+        "Inner edge (m)", "Centre (m)", "Outer edge (m)",
+    ]
+    ws3.append(headers3)
+    style_header_row(ws3, 3, len(headers3))
+    ws3.merge_cells(f"A1:{get_column_letter(len(headers3))}1")
+    for i, row in enumerate(camera_rows):
+        ws3.append(list(row))
+        style_data_rows(ws3, 4 + i, 4 + i, len(headers3))
+    auto_col_width(ws3, min_w=10, max_w=22)
+    ws3.freeze_panes = "B4"
+    ws3.row_dimensions[3].height = 36  # taller header for wrapped text
 
-    for row in camera_rows:
-        ws3.append(row)
-
+    # ── Sheet 4: Sample Area / Mission ───────────────────────────────────────
     if mission_rows:
         ws4 = wb.create_sheet("Sample Area")
+        sheet_title(ws4, "Sample Area & Flight Plan")
+        ws4.append([])
         ws4.append(["Metric", "Value"])
-        for row in mission_rows:
-            ws4.append(row)
+        style_header_row(ws4, 3, 2)
+        for i, row in enumerate(mission_rows):
+            ws4.append(list(row))
+            style_data_rows(ws4, 4 + i, 4 + i, 2)
+        ws4.merge_cells("A1:B1")
+        auto_col_width(ws4)
+        ws4.freeze_panes = "A4"
         if mission_figure_bytes:
             try:
                 img = XLImage(io.BytesIO(mission_figure_bytes))
-                img.width = 520
+                img.width  = 520
                 img.height = 390
                 ws4.add_image(img, "D2")
             except Exception:
@@ -879,12 +1122,37 @@ def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None
     return bio.getvalue()
 
 
-def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None, report_figures=None):
+def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None, report_figures=None, coverage_summary_data=None, fig_ms_6trigger_bytes=None):
     doc = Document()
 
     section = doc.sections[0]
     section.orientation = WD_ORIENT.LANDSCAPE
     section.page_width, section.page_height = section.page_height, section.page_width
+
+    # Landscape A4: page height 8.27", margins ~1" each = ~6.27" usable height.
+    # Heading + caption + spacing takes ~0.7" → max image height = 5.5"
+    # Max width = 7.5" (generous for wide figures).
+    # Each image is fitted to stay within both limits, preserving aspect ratio.
+    MAX_W_IN = 7.5
+    MAX_H_IN = 5.0   # conservative to ensure heading fits on same page
+
+    def fit_image(img_bytes):
+        """Return (width, height) as Inches objects fitting within MAX_W x MAX_H."""
+        try:
+            from PIL import Image as PilImage
+            with PilImage.open(io.BytesIO(img_bytes)) as im:
+                px_w, px_h = im.size
+            aspect = px_w / px_h if px_h else 1.0
+            # Scale to fit width
+            w = MAX_W_IN
+            h = w / aspect
+            # If too tall, scale down by height instead
+            if h > MAX_H_IN:
+                h = MAX_H_IN
+                w = h * aspect
+            return Inches(w), Inches(h)
+        except Exception:
+            return Inches(6.5), None  # fallback width-only
 
     logo_path = find_report_logo()
     if logo_path is not None:
@@ -898,13 +1166,13 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
     subtitle = doc.add_paragraph("Client summary of survey settings, coverage and camera geometry.")
     subtitle.runs[0].italic = True
 
+    # ── Settings + System summary — flow together, no forced page break ───────
     doc.add_heading("Summary of settings", level=2)
     table = doc.add_table(rows=1, cols=2)
     set_table_style(table, "Light List Accent 1")
     hdr = table.rows[0].cells
     hdr[0].text = "Item"
     hdr[1].text = "Value"
-
     for item, value in settings_rows:
         row = table.add_row().cells
         row[0].text = str(item)
@@ -921,6 +1189,43 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
         row[0].text = str(item)
         row[1].text = str(value)
 
+    # ── Camera results — flows after system summary ───────────────────────────
+    doc.add_heading("Camera results", level=2)
+    table2 = doc.add_table(rows=1, cols=13)
+    set_table_style(table2, "Medium Grid 1 Accent 1")
+    hdr2 = table2.rows[0].cells
+    for i, h in enumerate([
+        "Camera", "Inner oblique", "Outer oblique",
+        "Near angle", "Near class", "Far angle", "Far class",
+        "Inner GSD", "Centre GSD", "Outer GSD",
+        "Inner edge", "Centre", "Outer edge",
+    ]):
+        hdr2[i].text = h
+    for row_data in camera_rows:
+        row = table2.add_row().cells
+        for i, value in enumerate(row_data):
+            row[i].text = str(value)
+
+    # ── Point coverage summary — flows after camera table ─────────────────────
+    if coverage_summary_data:
+        doc.add_heading("Point coverage summary", level=2)
+        cov_table = doc.add_table(rows=1, cols=3)
+        set_table_style(cov_table, "Light Grid Accent 1")
+        hdr_cov = cov_table.rows[0].cells
+        hdr_cov[0].text = "Metric"
+        hdr_cov[1].text = "Image hits"
+        hdr_cov[2].text = "Viewing angles"
+        for label, hits_val, angles_val in [
+            ("Minimum",  str(coverage_summary_data.get("hits_min", "—")),   str(coverage_summary_data.get("angles_min", "—"))),
+            ("Average",  f"{coverage_summary_data.get('hits_avg', 0):.1f}", f"{coverage_summary_data.get('angles_avg', 0):.1f}"),
+            ("Maximum",  str(coverage_summary_data.get("hits_max", "—")),   str(coverage_summary_data.get("angles_max", "—"))),
+        ]:
+            row_c = cov_table.add_row().cells
+            row_c[0].text = label
+            row_c[1].text = hits_val
+            row_c[2].text = angles_val
+
+    # ── Mission area figure — page break so heading + image stay together ─────
     if mission_rows:
         doc.add_heading("Sample area and flight plan", level=2)
         mission_table = doc.add_table(rows=1, cols=2)
@@ -933,44 +1238,33 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
             row[0].text = str(item)
             row[1].text = str(value)
         if mission_figure_bytes:
-            title_p = doc.add_paragraph("Sample area and generated flight lines")
-            title_p.paragraph_format.keep_with_next = True
-            doc.add_picture(io.BytesIO(mission_figure_bytes), width=Inches(5.8))
+            fig_p = doc.add_paragraph("Flight plan map")
+            fig_p.paragraph_format.keep_with_next = True
+            fig_p.paragraph_format.space_before = Pt(6)
+            _w, _h = fit_image(mission_figure_bytes)
+            doc.add_picture(io.BytesIO(mission_figure_bytes), width=_w, height=_h)
 
-    doc.add_heading("Camera results", level=2)
-    table2 = doc.add_table(rows=1, cols=13)
-    set_table_style(table2, "Medium Grid 1 Accent 1")
-    hdr2 = table2.rows[0].cells
-    headers = [
-        "Camera",
-        "Inner edge oblique",
-        "Outer edge oblique",
-        "Near angle",
-        "Near class",
-        "Far angle",
-        "Far class",
-        "Inner GSD",
-        "Centre GSD",
-        "Outer GSD",
-        "Inner edge",
-        "Centre",
-        "Outer edge",
-    ]
+    # ── 6-trigger multi-strip graphic ─────────────────────────────────────────
+    if fig_ms_6trigger_bytes:
+        h6 = doc.add_heading("Multi-strip coverage — 6 trigger instances", level=2)
+        h6.paragraph_format.keep_with_next = True
+        p6 = doc.add_paragraph(
+            "Three adjacent strips showing 6 successive trigger instances. "
+            "Illustrates forward overlap, sidelap, and cross-track coverage band."
+        )
+        p6.paragraph_format.keep_with_next = True
+        _w, _h = fit_image(fig_ms_6trigger_bytes)
+        doc.add_picture(io.BytesIO(fig_ms_6trigger_bytes), width=_w, height=_h)
 
-    for i, h in enumerate(headers):
-        hdr2[i].text = h
-
-    for row_data in camera_rows:
-        row = table2.add_row().cells
-        for i, value in enumerate(row_data):
-            row[i].text = str(value)
-
+    # ── Coverage diagrams — each title keeps with its image ───────────────────
     if report_figures:
         doc.add_heading("Coverage diagrams", level=2)
         for figure_title, figure_bytes in report_figures:
             para = doc.add_paragraph(figure_title)
             para.paragraph_format.keep_with_next = True
-            doc.add_picture(io.BytesIO(figure_bytes), width=Inches(6.7))
+            para.paragraph_format.space_before = Pt(4)
+            _w, _h = fit_image(figure_bytes)
+            doc.add_picture(io.BytesIO(figure_bytes), width=_w, height=_h)
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -981,6 +1275,13 @@ def make_word_export(settings_rows, system_rows, camera_rows, mission_rows=None,
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Sync scenarios from GitHub once per session (persists across Cloud reboots)
+# Always sync from GitHub at session start — ensures scenarios survive reboots
+# Session state resets on reboot so this runs fresh each time
+if "gh_scenarios_synced" not in st.session_state:
+    _sync_scenarios_from_github()
+    st.session_state.gh_scenarios_synced = True
 
 if "cameras" not in st.session_state:
     st.session_state.cameras = [dict(c) for c in DEFAULT_CAMERAS]
@@ -1036,11 +1337,11 @@ def obliqueness_ratio(sol):
 
 def dark_fig(w=12, h=6):
     fig, ax = plt.subplots(figsize=(w, h))
-    fig.patch.set_facecolor("#0d1117")
-    ax.set_facecolor("#161b22")
-    ax.tick_params(colors="#8b949e", labelsize=8)
+    fig.patch.set_facecolor("#1a2332")   # dark navy — lighter than pure black
+    ax.set_facecolor("#1e2d40")          # slightly lighter navy for plot area
+    ax.tick_params(colors="#a0aec0", labelsize=8)
     for sp in ax.spines.values():
-        sp.set_color("#30363d")
+        sp.set_color("#3d5166")
     return fig, ax
 
 def corner_inner_outer(sol):
@@ -1924,21 +2225,85 @@ def kml_ring_to_lonlat(coords_text):
     return pts
 
 
+def _detect_kml_crs(points):
+    """Detect whether KML coordinate values are WGS84 or NZTM.
+
+    KML spec requires WGS84 but some GIS tools export in projected CRS.
+    NZTM eastings: ~1,000,000–2,000,000  northings: ~4,700,000–6,200,000
+    WGS84 lons:    ~166–178              lats:      ~-48 to -34
+
+    Returns 'nztm' or 'wgs84'.
+    """
+    if not points:
+        return "wgs84"
+    x_vals = [p[0] for p in points]
+    # NZTM eastings are always > 100,000; WGS84 lons never exceed 180
+    if min(x_vals) > 100_000:
+        return "nztm"
+    return "wgs84"
+
+
 def lonlat_to_local_xy(points):
+    """Convert KML coordinate points to NZTM-centred local metres.
+
+    Auto-detects whether the KML uses WGS84 or NZTM coordinates and
+    projects to NZTM (EPSG:2193) either way.  The output is centred on
+    the AOI centroid so axis values show offsets in km from the centre.
+
+    Returns:
+        (local_points, lon0, lat0) where lon0/lat0 is the WGS84 centroid
+        (used by the basemap tile fetcher).
+    """
     if not points:
         return [], 0.0, 0.0
-    lons = [p[0] for p in points]
-    lats = [p[1] for p in points]
-    lon0 = float(sum(lons) / len(lons))
-    lat0 = float(sum(lats) / len(lats))
-    r = 6378137.0
-    cos_lat = math.cos(math.radians(lat0))
-    local = []
-    for lon, lat in points:
-        x = r * math.radians(lon - lon0) * cos_lat
-        y = r * math.radians(lat - lat0)
-        local.append((x, y))
-    return local, lon0, lat0
+
+    try:
+        import pyproj
+
+        crs = _detect_kml_crs(points)
+
+        if crs == "nztm":
+            # Already in NZTM — convert centroid to WGS84 for basemap reference
+            e_vals = [p[0] for p in points]
+            n_vals = [p[1] for p in points]
+            nztm_pts = list(points)
+            nztm_to_wgs84 = pyproj.Transformer.from_crs(
+                "EPSG:2193", "EPSG:4326", always_xy=True
+            )
+            e_cen = sum(e_vals) / len(e_vals)
+            n_cen = sum(n_vals) / len(n_vals)
+            lon0, lat0 = nztm_to_wgs84.transform(e_cen, n_cen)
+        else:
+            # WGS84 — project to NZTM, derive lon0/lat0 from input centroid
+            lons = [p[0] for p in points]
+            lats = [p[1] for p in points]
+            lon0 = float(sum(lons) / len(lons))
+            lat0 = float(sum(lats) / len(lats))
+            wgs84_to_nztm = pyproj.Transformer.from_crs(
+                "EPSG:4326", "EPSG:2193", always_xy=True
+            )
+            nztm_pts = [wgs84_to_nztm.transform(lon, lat) for lon, lat in points]
+
+        # Centre on NZTM centroid so axes show km offsets from AOI centre
+        e_vals = [p[0] for p in nztm_pts]
+        n_vals = [p[1] for p in nztm_pts]
+        e0 = sum(e_vals) / len(e_vals)
+        n0 = sum(n_vals) / len(n_vals)
+        local = [(e - e0, n - n0) for e, n in nztm_pts]
+        return local, lon0, lat0
+
+    except ImportError:
+        # pyproj not available — flat-earth fallback
+        lons = [p[0] for p in points]
+        lats = [p[1] for p in points]
+        lon0 = float(sum(lons) / len(lons))
+        lat0 = float(sum(lats) / len(lats))
+        r = 6378137.0
+        cos_lat = math.cos(math.radians(lat0))
+        local = [(r * math.radians(lon - lon0) * cos_lat,
+                  r * math.radians(lat - lat0))
+                 for lon, lat in points]
+        return local, lon0, lat0
 
 
 def parse_kml_aoi(path):
@@ -1965,18 +2330,95 @@ def parse_kml_aoi(path):
         if str(elem.tag).lower().endswith("coordinates") and (elem.text or "").strip():
             coord_texts.append(elem.text)
 
-    polygons = []
+    # ── Pass 1: collect all raw lonlat points and build a temporary polygon
+    # using a simple flat-earth projection to get the Shapely polygon ──────────
     all_lonlat = []
-    lon0_ref = lat0_ref = None
+    temp_polygons = []
     for coords_text in coord_texts:
         lonlat_ring = kml_ring_to_lonlat(coords_text)
         if len(lonlat_ring) < 4:
             continue
         all_lonlat.extend(lonlat_ring)
-        local_ring, lon0, lat0 = lonlat_to_local_xy(lonlat_ring)
-        if lon0_ref is None:
-            lon0_ref, lat0_ref = lon0, lat0
+        # Temporary flat-earth local ring just to build the Shapely polygon
+        _, _lon0, _lat0 = lonlat_to_local_xy(lonlat_ring)
+        local_ring, _, _ = lonlat_to_local_xy(lonlat_ring)
         try:
+            poly = ShapelyPolygon(local_ring)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.is_empty and poly.area > 0:
+                temp_polygons.append((lonlat_ring, poly))
+        except Exception:
+            continue
+
+    if not temp_polygons:
+        raise RuntimeError("No valid polygon coordinates were found in that KML.")
+
+    # ── Detect CRS and compute WGS84 bounds ──────────────────────────────────
+    crs = _detect_kml_crs(all_lonlat)
+    lons_raw = [p[0] for p in all_lonlat]
+    lats_raw = [p[1] for p in all_lonlat]
+
+    if crs == "nztm":
+        try:
+            import pyproj as _pj
+            _n2w = _pj.Transformer.from_crs("EPSG:2193","EPSG:4326",always_xy=True)
+            sw = _n2w.transform(min(lons_raw), min(lats_raw))
+            ne = _n2w.transform(max(lons_raw), max(lats_raw))
+            _lon_min, _lat_min = min(sw[0],ne[0]), min(sw[1],ne[1])
+            _lon_max, _lat_max = max(sw[0],ne[0]), max(sw[1],ne[1])
+        except ImportError:
+            _lon_min,_lon_max = float(min(lons_raw)),float(max(lons_raw))
+            _lat_min,_lat_max = float(min(lats_raw)),float(max(lats_raw))
+    else:
+        _lon_min,_lon_max = float(min(lons_raw)),float(max(lons_raw))
+        _lat_min,_lat_max = float(min(lats_raw)),float(max(lats_raw))
+
+    # ── Use the geographic bounds centre as the projection origin ─────────────
+    # This is the area-proportional centroid of the bounding box — much more
+    # stable than averaging vertex coordinates (which are biased by vertex density).
+    lon0 = 0.5 * (_lon_min + _lon_max)
+    lat0 = 0.5 * (_lat_min + _lat_max)
+
+    # ── Pass 2: project all rings into Web Mercator (EPSG:3857) offsets ────────
+    # Using Web Mercator for the polygon means the basemap tile fetch (also in
+    # EPSG:3857) uses exactly the same coordinate system — no conversion error.
+    # We store the Web Mercator position of the bbox centre (mx0, my0) so the
+    # basemap code can reconstruct absolute Mercator coords from local offsets.
+    try:
+        import pyproj as _pj
+        _wgs_merc = _pj.Transformer.from_crs("EPSG:4326","EPSG:3857",always_xy=True)
+        # If KML is in NZTM, convert to WGS84 first
+        _nztm_wgs = _pj.Transformer.from_crs("EPSG:2193","EPSG:4326",always_xy=True)
+        # Web Mercator position of the projection origin (bbox centre)
+        mx0, my0 = _wgs_merc.transform(lon0, lat0)
+        use_merc = True
+    except ImportError:
+        use_merc = False
+        mx0 = my0 = 0.0
+        r = 6378137.0
+        cos_lat = math.cos(math.radians(lat0))
+
+    polygons = []
+    for lonlat_ring, _ in temp_polygons:
+        try:
+            if use_merc:
+                if crs == "nztm":
+                    # NZTM → WGS84 → Web Mercator
+                    wgs_ring = [_nztm_wgs.transform(e, n) for e, n in lonlat_ring]
+                    merc_ring = [_wgs_merc.transform(lon, lat) for lon, lat in wgs_ring]
+                else:
+                    # WGS84 → Web Mercator
+                    merc_ring = [_wgs_merc.transform(lon, lat) for lon, lat in lonlat_ring]
+                # Offset from Mercator origin so local (0,0) = bbox centre
+                local_ring = [(mx - mx0, my - my0) for mx, my in merc_ring]
+            else:
+                # Flat-earth fallback (no pyproj)
+                local_ring = [
+                    (r * math.radians(lon - lon0) * cos_lat,
+                     r * math.radians(lat - lat0))
+                    for lon, lat in lonlat_ring
+                ]
             poly = ShapelyPolygon(local_ring)
             if not poly.is_valid:
                 poly = poly.buffer(0)
@@ -1991,22 +2433,54 @@ def parse_kml_aoi(path):
     aoi_poly = unary_union(polygons)
     if aoi_poly.is_empty:
         raise RuntimeError("The KML geometry did not produce a usable AOI polygon.")
+    # Simplify for display — keeps rendering fast for large KML files.
+    # 1m tolerance preserves all visible detail at survey scales.
+    try:
+        _simp = aoi_poly.simplify(1.0, preserve_topology=True)
+        if not _simp.is_empty and _simp.is_valid:
+            aoi_poly = _simp
+    except Exception:
+        pass
 
-    # Store geographic reference so make_aoi_mission_figure can fetch map tiles
-    lons = [p[0] for p in all_lonlat]
-    lats = [p[1] for p in all_lonlat]
     return {
         "name":     Path(path).stem,
         "source":   "kml_library",
         "polygon":  aoi_poly,
         "area_m2":  float(aoi_poly.area),
-        "lon0":     float(lon0_ref) if lon0_ref is not None else None,
-        "lat0":     float(lat0_ref) if lat0_ref is not None else None,
-        "lon_min":  float(min(lons)),
-        "lon_max":  float(max(lons)),
-        "lat_min":  float(min(lats)),
-        "lat_max":  float(max(lats)),
+        "lon0":     float(lon0),
+        "lat0":     float(lat0),
+        "mx0":      float(mx0),   # Web Mercator X of bbox centre
+        "my0":      float(my0),   # Web Mercator Y of bbox centre
+        "lon_min":  _lon_min,
+        "lon_max":  _lon_max,
+        "lat_min":  _lat_min,
+        "lat_max":  _lat_max,
     }
+
+
+def build_buffered_aoi(aoi_payload, buffer_m):
+    """Return a copy of aoi_payload with the polygon expanded by buffer_m metres.
+    The buffer is applied in the local Mercator coordinate space.
+    All geographic fields (lon0, lat0, mx0, my0, bounds) are updated to reflect
+    the larger polygon.
+    """
+    if aoi_payload is None or not SHAPELY_AVAILABLE:
+        return aoi_payload
+    poly = aoi_payload.get("polygon")
+    if poly is None or buffer_m <= 0:
+        return aoi_payload
+    try:
+        buffered = poly.buffer(float(buffer_m), join_style=2)  # mitre join for sharp corners
+        if buffered.is_empty or not buffered.is_valid:
+            return aoi_payload
+        result = dict(aoi_payload)
+        result["original_polygon"] = poly          # preserve original BEFORE overwriting
+        result["polygon"]  = buffered
+        result["area_m2"]  = float(buffered.area)
+        result["buffered_m"] = float(buffer_m)
+        return result
+    except Exception:
+        return aoi_payload
 
 
 def build_standard_aoi(area_km2=100.0):
@@ -2054,7 +2528,7 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
+def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not SHAPELY_AVAILABLE:
         return None
     if aoi_payload is None:
@@ -2068,32 +2542,90 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     turn_time_per_line_s = max(float(turn_time_per_line_min), 0.0) * 60.0
 
     rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
+
+    # Note: we intentionally do NOT simplify the rotated polygon here.
+    # Simplification can shift edge vertices inward and cause flight lines
+    # to miss the AOI boundary. The polygon is already simplified at parse
+    # time (parse_kml_aoi) which is sufficient for speed.
+
     minx, miny, maxx, maxy = rotated.bounds
     width = maxx - minx
     if not np.isfinite(width) or width < 0:
         return None
 
-    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 1)
-    offsets = [minx + i * line_spacing_m for i in range(n_candidates)]
+    # Generate offsets that fully span minx..maxx with one extra line on each
+    # side so partial-width edge strips are never missed.
+    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 2)
+    # Start half a spacing before minx so edge of AOI is always covered
+    start_x = minx - (line_spacing_m * 0.5)
+    offsets = [start_x + i * line_spacing_m for i in range(n_candidates + 1)]
+    # Keep only those within the AOI bounds (plus one line width margin)
+    offsets = [x for x in offsets if x <= maxx + line_spacing_m]
     pad = max(maxy - miny, 1.0) + max(float(lead_in_out_m), 0.0) + 1000.0
+    # Along-track extension: ensures fore/aft footprints reach the AOI boundary.
+    # Use actual camera along-track reach if provided, else photo_spacing proxy.
+    _max_along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
 
     line_count = 0
     total_line_length_m = 0.0
     total_exposures = 0
     line_lengths_m = []
+    raw_segments = []   # store segments so we don't intersect twice
 
+    # Flight lines run the full bounding-box height without clipping to the
+    # AOI polygon. This ensures complete coverage along irregular coastlines
+    # and concave boundaries — the buffer zone is automatically included.
+    # We only generate a line if it intersects the AOI (to avoid lines far
+    # outside the area), but the line itself is not clipped.
     for x in offsets:
         base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
+        # Check if this x position intersects the AOI at all
+        if not rotated.intersects(base_line):
+            continue
+        # Get the intersection to determine the actual extent of the line
+        # within the AOI — used for start/end points only
         intersection = rotated.intersection(base_line)
-        for seg in iter_line_geometries(intersection):
-            seg_length = float(seg.length)
+        segs = list(iter_line_geometries(intersection))
+        if not segs:
+            continue
+        # Sort segments by y position
+        segs_sorted = sorted(segs, key=lambda s: list(s.coords)[0][1])
+        # Water gap threshold: if gap between segments > 3x line_spacing, split
+        # so we don't fly long stretches over open water
+        water_gap_threshold = line_spacing_m * 3.0
+
+        # Group consecutive segments that are close together
+        groups = []
+        current_group = [segs_sorted[0]]
+        for seg_i in segs_sorted[1:]:
+            prev_end   = max(c[1] for c in list(current_group[-1].coords))
+            this_start = min(c[1] for c in list(seg_i.coords))
+            if (this_start - prev_end) > water_gap_threshold:
+                groups.append(current_group)
+                current_group = [seg_i]
+            else:
+                current_group.append(seg_i)
+        groups.append(current_group)
+
+        # Create one flight line per group
+        for group in groups:
+            all_coords = []
+            for gs in group:
+                all_coords.extend(list(gs.coords))
+            if len(all_coords) < 2:
+                continue
+            all_coords.sort(key=lambda c: c[1])
+            y_start = all_coords[0][1] - max(float(lead_in_out_m), 0.0) - _max_along_reach
+            y_end   = all_coords[-1][1] + max(float(lead_in_out_m), 0.0) + _max_along_reach
+            full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
+            seg_length = float(full_seg.length)
             if seg_length <= 0:
                 continue
-            mission_length = seg_length + 2.0 * max(float(lead_in_out_m), 0.0)
             line_count += 1
-            total_line_length_m += mission_length
-            line_lengths_m.append(mission_length)
-            total_exposures += max(1, int(math.ceil(mission_length / photo_spacing_m)) + 1)
+            total_line_length_m += seg_length
+            line_lengths_m.append(seg_length)
+            total_exposures += max(1, int(math.ceil(seg_length / photo_spacing_m)) + 1)
+            raw_segments.append(full_seg)
 
     enabled_cam_count = max(1, len(enabled_cameras))
     total_images = total_exposures * enabled_cam_count
@@ -2109,39 +2641,44 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
     flight_time_s = airborne_time_s + total_turn_time_s if np.isfinite(airborne_time_s) else float("nan")
 
     mission_line_geometries = []
-    for x in offsets:
-        base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
-        intersection = rotated.intersection(base_line)
-        for seg in iter_line_geometries(intersection):
-            seg_length = float(seg.length)
-            if seg_length <= 0:
-                continue
-            coords = list(seg.coords)
-            if len(coords) < 2:
-                continue
-            start = coords[0]
-            end = coords[-1]
-            dy = end[1] - start[1]
-            seg_len = math.hypot(end[0] - start[0], dy)
-            if seg_len <= 0:
-                continue
-            extend = max(float(lead_in_out_m), 0.0)
-            ux = (end[0] - start[0]) / seg_len
-            uy = dy / seg_len
-            ext_start = (start[0] - ux * extend, start[1] - uy * extend)
-            ext_end = (end[0] + ux * extend, end[1] + uy * extend)
-            try:
-                ext_line = ShapelyLineString([ext_start, ext_end])
-                mission_line_geometries.append(
-                    shapely_rotate(ext_line, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+    for seg in raw_segments:
+        # Segments already include lead-in/out — just rotate back to original coords
+        try:
+            mission_line_geometries.append(
+                shapely_rotate(seg, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+            )
+        except Exception:
+            continue
+
+    # ── Coverage QA: check what fraction of AOI is covered by flight strips ──
+    coverage_pct = None
+    try:
+        if SHAPELY_AVAILABLE and raw_segments and line_spacing_m > 0:
+            half_w = line_spacing_m / 2.0
+            strips = []
+            for seg in raw_segments:
+                coords = list(seg.coords)
+                if len(coords) >= 2:
+                    # Buffer each segment by half line spacing to form a strip
+                    strips.append(seg.buffer(half_w, cap_style=2))  # flat caps
+            if strips:
+                covered = unary_union(strips)
+                # Rotate back to original orientation for comparison with polygon
+                covered_orig = shapely_rotate(
+                    covered, -float(flight_azimuth_deg),
+                    origin=polygon.centroid, use_radians=False
                 )
-            except Exception:
-                continue
+                intersection_area = polygon.intersection(covered_orig).area
+                if polygon.area > 0:
+                    coverage_pct = round(100.0 * intersection_area / polygon.area, 1)
+    except Exception:
+        coverage_pct = None
 
     return {
         "name": aoi_payload.get("name", "AOI"),
         "source": aoi_payload.get("source", "unknown"),
         "area_m2": float(aoi_payload.get("area_m2", polygon.area)),
+        "coverage_pct": coverage_pct,
         "line_count": int(line_count),
         "total_line_length_m": float(total_line_length_m),
         "average_line_length_m": float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
@@ -2161,11 +2698,24 @@ def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, sp
         "flight_azimuth_deg": float(flight_azimuth_deg),
         "lead_in_out_m": float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
-        "aoi_polygon": polygon,
+        "aoi_polygon": polygon,        # buffered polygon used for flight line generation
+        "original_aoi_polygon": (aoi_payload.get("original_polygon")  # original pre-buffer
+                                 or aoi_payload.get("polygon")),       # fallback if no buffer
+        # Geographic reference — passed through from aoi_payload so
+        # make_aoi_mission_figure can fetch map tiles for the correct location.
+        "lon0":      aoi_payload.get("lon0"),
+        "lat0":      aoi_payload.get("lat0"),
+        "mx0":       aoi_payload.get("mx0"),
+        "my0":       aoi_payload.get("my0"),
+        "lon_min":   aoi_payload.get("lon_min"),
+        "lon_max":   aoi_payload.get("lon_max"),
+        "lat_min":   aoi_payload.get("lat_min"),
+        "lat_max":   aoi_payload.get("lat_max"),
+        "buffered_m": aoi_payload.get("buffered_m", 0.0),
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -2201,14 +2751,14 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
     return result
 
 
-def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, basemap_style="osm"):
+def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, basemap_style="osm", original_aoi_poly=None):
     if mission_outputs is None:
         return None
     polygon = mission_outputs.get("aoi_polygon")
     if polygon is None or getattr(polygon, "is_empty", True):
         return None
 
-    fig, ax = dark_fig(4.2, 3.35)
+    fig, ax = dark_fig(7.0, 7.0)
     ax.set_aspect("equal")
 
     all_x = []
@@ -2236,7 +2786,7 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         x_mid = 0.5 * (x_min + x_max)
         y_mid = 0.5 * (y_min + y_max)
         half_span = 0.5 * max(x_span, y_span)
-        pad = max(half_span * 0.12, 1.0)
+        pad = max(half_span * 0.18, 1.0)  # 18% padding gives context around the AOI
         x_lo, x_hi = x_mid - half_span - pad, x_mid + half_span + pad
         y_lo, y_hi = y_mid - half_span - pad, y_mid + half_span + pad
     else:
@@ -2261,14 +2811,30 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ix, iy = interior.xy
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
-    _plot_poly(polygon)
+    _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
+
+    # Draw original (unbuffered) AOI as dashed white outline if buffer applied
+    if original_aoi_poly is not None and not getattr(original_aoi_poly, "is_empty", True):
+        try:
+            _orig_geoms = ([original_aoi_poly]
+                           if getattr(original_aoi_poly, "geom_type", "") == "Polygon"
+                           else list(getattr(original_aoi_poly, "geoms", [])))
+            for _og in _orig_geoms:
+                if getattr(_og, "is_empty", True):
+                    continue
+                _ox, _oy = _og.exterior.xy
+                ax.plot(_sx(_ox), _sx(_oy),
+                        color="#ffffff", lw=1.5, ls="--", alpha=0.8, zorder=5,
+                        label="Original AOI")
+        except Exception:
+            pass
 
     for line in mission_outputs.get("mission_line_geometries", []):
         try:
             x, y = line.xy
         except Exception:
             continue
-        ax.plot(_sx(x), _sx(y), color="#f0c040", lw=1.5, alpha=0.95, zorder=4)
+        ax.plot(_sx(x), _sx(y), color="#f0c040", lw=1.0, alpha=0.85, zorder=4)
 
     ax.set_xlim(x_lo / scale, x_hi / scale)
     ax.set_ylim(y_lo / scale, y_hi / scale)
@@ -2281,11 +2847,15 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
         pass
 
     # ── Basemap tile overlay ──
-    # Requires contextily and a geographic reference stored in the AOI payload.
-    # Falls back silently if contextily is not installed or the AOI has no geo ref.
+    # Uses contextily to add map tiles. The key insight: contextily's add_basemap
+    # works directly on the axes if we set the axes limits in Web Mercator (EPSG:3857)
+    # coordinates first, then restore our local display limits after.
+    #
+    # Returns a debug message that the caller can display if tiles fail.
+    _basemap_error = None
     if show_basemap:
-        lon0  = mission_outputs.get("lon0")
-        lat0  = mission_outputs.get("lat0")
+        lon0    = mission_outputs.get("lon0")
+        lat0    = mission_outputs.get("lat0")
         lon_min = mission_outputs.get("lon_min")
         lon_max = mission_outputs.get("lon_max")
         lat_min = mission_outputs.get("lat_min")
@@ -2295,84 +2865,108 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 import contextily as ctx
                 import pyproj
 
-                # Re-express the axes limits in Web Mercator (EPSG:3857)
-                # so contextily can fetch the right tiles.
-                transformer = pyproj.Transformer.from_crs(
-                    "EPSG:4326", "EPSG:3857", always_xy=True
-                )
+                # ── Coordinate alignment strategy ──────────────────────────────
+                # The AOI polygon is drawn in local metres with origin at
+                # (lon0, lat0) — the centroid of the first KML ring.
+                # The tile image must be positioned so that (lon0, lat0) maps
+                # to local (0, 0), and the tile's geographic extent maps to the
+                # correct local metre offsets.
+                #
+                # Steps:
+                #  1. Convert display axes limits (local metres) to lon/lat
+                #  2. Project those to Web Mercator for tile fetching
+                #  3. After fetching, set the image extent using the SAME
+                #     local-metre values so the tile aligns with the polygon.
 
-                # Convert local-metre axes limits back to lon/lat, then to Web Mercator
-                r = 6378137.0
-                cos_lat = math.cos(math.radians(lat0))
+                # ── Tile alignment ─────────────────────────────────────────
+                # The polygon is stored in Web Mercator offsets from (mx0,my0).
+                # x_lo/x_hi/y_lo/y_hi are those same Mercator offsets (metres).
+                # Adding mx0/my0 gives absolute Web Mercator coordinates, which
+                # contextily uses directly — no conversion, no mismatch.
 
-                def local_to_lonlat(lx, ly):
-                    """Convert local-metre offset back to lon/lat."""
-                    lon = math.degrees(lx / (r * cos_lat)) + lon0
-                    lat = math.degrees(ly / r) + lat0
-                    return lon, lat
+                mx0 = float(mission_outputs.get("mx0") or 0.0)
+                my0 = float(mission_outputs.get("my0") or 0.0)
 
-                # Axes limits are already in display units (km or m).
-                # Convert back to metres for the local->lonlat transform.
-                lx_lo = x_lo; lx_hi = x_hi
-                ly_lo = y_lo; ly_hi = y_hi
-
-                ll_sw = local_to_lonlat(lx_lo, ly_lo)
-                ll_ne = local_to_lonlat(lx_hi, ly_hi)
-
-                merc_sw = transformer.transform(ll_sw[0], ll_sw[1])
-                merc_ne = transformer.transform(ll_ne[0], ll_ne[1])
-
-                # Create a temporary axes in Web Mercator to let contextily
-                # fetch tiles, then blend the tile image onto our axes.
-                fig_tmp, ax_tmp = plt.subplots(1, 1, figsize=(1, 1))
-                ax_tmp.set_xlim(merc_sw[0], merc_ne[0])
-                ax_tmp.set_ylim(merc_sw[1], merc_ne[1])
+                # Absolute Web Mercator extent for tile fetch
+                merc_w = mx0 + x_lo
+                merc_e = mx0 + x_hi
+                merc_s = my0 + y_lo
+                merc_n = my0 + y_hi
 
                 tile_source = (
                     ctx.providers.Esri.WorldImagery
                     if basemap_style == "satellite"
                     else ctx.providers.OpenStreetMap.Mapnik
                 )
-                ctx.add_basemap(ax_tmp, source=tile_source, crs="EPSG:3857")
 
-                # Extract the tile image from the temporary axes
-                tile_img = None
-                for im in ax_tmp.get_images():
-                    tile_img = im
-                    break
-                plt.close(fig_tmp)
+                # Fetch tiles into a temporary figure.
+                # contextily snaps to tile boundaries so the image may be
+                # larger than the requested extent. We must read the ACTUAL
+                # extent it placed and convert that to local display coords.
+                _fig_tmp, _ax_tmp = plt.subplots(1, 1, figsize=(2, 2))
+                _ax_tmp.set_xlim(merc_w, merc_e)
+                _ax_tmp.set_ylim(merc_s, merc_n)
+                ctx.add_basemap(
+                    _ax_tmp,
+                    crs="EPSG:3857",
+                    source=tile_source,
+                    reset_extent=False,
+                    attribution_size=1,
+                )
+                _tile_arr = None
+                _tile_extent = None
+                for _im in _ax_tmp.get_images():
+                    _raw = _im.get_array()
+                    if _raw is not None and _raw.ndim >= 2:
+                        _tile_arr = _raw
+                        # get_extent() returns [left, right, bottom, top] in Mercator
+                        _tile_extent = _im.get_extent()
+                        break
+                plt.close(_fig_tmp)
 
-                if tile_img is not None:
-                    # Get the tile image array and display it on our axes
-                    import numpy as np
-                    img_arr = tile_img.get_array()
-                    # Map the Web Mercator extent back to local display coordinates
+                if _tile_arr is not None and _tile_extent is not None:
+                    # Convert actual tile extent from Mercator to local display units
+                    _ext_x_lo = (_tile_extent[0] - mx0) / scale
+                    _ext_x_hi = (_tile_extent[1] - mx0) / scale
+                    _ext_y_lo = (_tile_extent[2] - my0) / scale
+                    _ext_y_hi = (_tile_extent[3] - my0) / scale
                     ax.imshow(
-                        img_arr,
-                        extent=[x_lo / scale, x_hi / scale, y_lo / scale, y_hi / scale],
+                        _tile_arr,
+                        extent=[_ext_x_lo, _ext_x_hi, _ext_y_lo, _ext_y_hi],
                         aspect="auto",
                         origin="upper",
-                        alpha=0.55,
+                        alpha=0.65,
                         zorder=1,
                     )
-                    # Re-draw polygon and lines on top (zorder already set correctly)
-                    ax.set_xlim(x_lo / scale, x_hi / scale)
-                    ax.set_ylim(y_lo / scale, y_hi / scale)
+
+                # Attribution text
+                ax.annotate(
+                    "© OpenStreetMap contributors" if basemap_style != "satellite" else "© Esri",
+                    xy=(0.01, 0.01), xycoords="axes fraction",
+                    fontsize=5, color="#aaaaaa", alpha=0.7, zorder=5,
+                )
 
             except ImportError:
-                pass  # contextily not installed — silent fallback to no basemap
-            except Exception:
-                pass  # network error or other issue — silent fallback
+                _basemap_error = "contextily / pyproj not installed — reboot app to install packages."
+            except Exception as _e:
+                _basemap_error = f"Basemap tile fetch failed: {_e}"
+        else:
+            _basemap_error = "No geographic reference in AOI — basemap only works with KML files, not the standard example."
 
+    # Axis labels and title — always applied, after basemap so they sit on top
     xt = ax.get_xticks()
-    ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt], color="#8b949e")
+    ax.set_xticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in xt],
+                        color="#8b949e", fontsize=8)
     yt = ax.get_yticks()
-    ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt], color="#8b949e")
-    ax.set_xlabel(f"Local easting ({axis_unit})", color="#8b949e")
-    ax.set_ylabel(f"Local northing ({axis_unit})", color="#8b949e")
-    ax.set_title("AOI and generated flight lines", color="#c9d1d9", fontsize=11)
-    fig.tight_layout()
-    return fig
+    ax.set_yticklabels([f"{t:.1f}" if display_in_km else f"{t:.0f}" for t in yt],
+                        color="#8b949e", fontsize=8)
+    ax.set_xlabel(f"Easting offset ({axis_unit})", color="#8b949e", fontsize=9)
+    ax.set_ylabel(f"Northing offset ({axis_unit})", color="#8b949e", fontsize=9)
+    _aoi_name = mission_outputs.get("name", "AOI")
+    ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
+    ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
+    fig.tight_layout(pad=1.5)
+    return fig, _basemap_error
 
 
 # Apply any scenario requested on the previous run before widgets are created.
@@ -2496,45 +3090,116 @@ fwd_frac  = fwd_pct  / 100.0
 side_frac = side_pct / 100.0
 
 st.sidebar.markdown("---")
+_gh_configured = _gh_config() is not None
 st.sidebar.subheader("💾 Save / Load")
+if _gh_configured:
+    _sync_result = st.session_state.get("gh_sync_result", "not_run")
+    if _sync_result.startswith("ok:0"):
+        # Synced but got zero files — means GitHub folder is empty or fetch failed
+        st.sidebar.warning("☁️ GitHub connected but 0 scenarios found in repo. Check saved_scenarios folder exists.")
+    elif _sync_result.startswith("ok:"):
+        _n = _sync_result.split(":")[1]
+        _extra = " ⚠️ some failed" if "failed" in _sync_result else ""
+        st.sidebar.caption(f"☁️ GitHub sync active — {_n} scenario(s) loaded.{_extra}")
+    elif _sync_result == "not_run":
+        st.sidebar.caption("☁️ GitHub sync active — syncing...")
+    else:
+        st.sidebar.caption("☁️ GitHub sync active.")
 
-storage_status = github_storage_status()
-if storage_status["mode"] == "github":
-    st.sidebar.success(f"Scenario storage: {storage_status['summary']}")
+    # Debug expander — shows exactly what happened
+    with st.sidebar.expander("🔍 Sync diagnostics"):
+        cfg = _gh_config()
+        if cfg:
+            token, repo, branch, folder = cfg
+            st.write(f"**Repo:** {repo}")
+            st.write(f"**Branch:** {branch}")
+            st.write(f"**Folder:** {folder}")
+            st.write(f"**Sync result:** {_sync_result}")
+            st.write(f"**Local scenarios:** {[p.name for p in SCENARIO_DIR.glob('*.json')] if SCENARIO_DIR.exists() else 'dir missing'}")
+            if st.button("🔄 Re-sync from GitHub", key="resync_btn"):
+                _sync_scenarios_from_github()
+                st.session_state.gh_scenarios_synced = True
+                st.rerun()
+            if st.button("🧪 Test GitHub connection", key="test_gh_btn"):
+                _items = _gh_list_scenarios()
+                if _items:
+                    st.success(f"Found {len(_items)} file(s): {[n for n,_ in _items]}")
+                else:
+                    st.warning("0 files — folder empty or unreadable")
+
+            if st.button("🔬 Test write access", key="test_write_btn"):
+                _ok, _err = _gh_push_scenario("_test_write_check", '{"test":true}')
+                if _ok:
+                    # Clean up test file
+                    _gh_delete_scenario("_test_write_check")
+                    st.success("✅ Write access confirmed! GitHub push works.")
+                else:
+                    cfg2 = _gh_config()
+                    if cfg2:
+                        t2, r2, b2, f2 = cfg2
+                        st.error(f"❌ Write failed: {_err}")
+                        st.code(f"URL tested: https://api.github.com/repos/{r2}/contents/{f2}/_test_write_check.json")
 else:
-    st.sidebar.info(f"Scenario storage: {storage_status['summary']}")
+    st.sidebar.caption("⚠️ No GitHub sync — scenarios lost on reboot. Ask admin to configure GitHub secrets.")
 
 if "scenario_flash_message" in st.session_state:
     flash = st.session_state.pop("scenario_flash_message")
     flash_level = flash.get("level", "success")
     getattr(st.sidebar, flash_level, st.sidebar.success)(flash.get("text", "Scenario updated."))
 
+scenario_records = list_saved_scenarios()
+
 sc_name = st.sidebar.text_input("Scenario name", "my_survey")
+
+# Check if scenario already exists
+_sc_filename = sc_name if sc_name.endswith(".json") else f"{sc_name}.json"
+_sc_exists = (scenario_path_from_name(sc_name)).exists()
+
 if st.sidebar.button("Save scenario"):
-    try:
-        saved_record = save_scenario({
+    if _sc_exists and not st.session_state.get("confirm_overwrite_name") == sc_name:
+        # First click — ask for confirmation
+        st.session_state["confirm_overwrite_name"] = sc_name
+        st.rerun()
+    else:
+        # Either new scenario or confirmed overwrite
+        st.session_state.pop("confirm_overwrite_name", None)
+        _sc_data = {
             "cameras": st.session_state.cameras,
             "altitude_m": altitude_m,
             "speed_ms": speed_ms,
             "fwd_overlap_pct": fwd_pct,
             "sidelap_pct": side_pct,
             "reciprocal": reciprocal,
-        }, sc_name)
-        saved_label = saved_record.get("label", scenario_filename(sc_name))
-        saved_destination = saved_record.get("saved_to", "saved_scenarios")
-        flash_text = f"Saved {saved_label} to {saved_destination}"
-        if saved_record.get("branch"):
-            flash_text += f" on branch {saved_record['branch']}"
-        st.session_state.scenario_flash_message = {
-            "level": "success",
-            "text": flash_text,
         }
-        st.session_state.selected_scenario_label = saved_label
-        st.session_state.saved_scenario_selector = saved_label
-        st.session_state.saved_scenario_selector_prev = saved_label
+        saved_path, _gh_ok, _gh_err = save_scenario(_sc_data, sc_name)
+        if _gh_ok:
+            _gh_msg = " and synced to GitHub ✓"
+            _flash_level = "success"
+        elif _gh_config() is None:
+            _gh_msg = " (local only — configure GitHub secrets to persist)"
+            _flash_level = "warning"
+        else:
+            _gh_msg = f" — GitHub sync FAILED: {_gh_err}"
+            _flash_level = "error"
+        st.session_state.scenario_flash_message = {
+            "level": _flash_level,
+            "text": f"Saved {saved_path.name}{_gh_msg}",
+        }
+        st.session_state.selected_scenario_label = saved_path.name
+        st.session_state.saved_scenario_selector = saved_path.name
+        st.session_state.saved_scenario_selector_prev = saved_path.name
         st.rerun()
-    except Exception as exc:
-        st.sidebar.error(str(exc))
+
+# Overwrite confirmation prompt
+if st.session_state.get("confirm_overwrite_name") == sc_name:
+    st.sidebar.warning(f"⚠️ **'{sc_name}'** already exists. Overwrite?")
+    _col_yes, _col_no = st.sidebar.columns(2)
+    if _col_yes.button("✓ Yes, overwrite", key="confirm_overwrite_yes"):
+        st.session_state["confirm_overwrite_name"] = sc_name  # keep set so next Save proceeds
+        st.rerun()
+    if _col_no.button("✗ Cancel", key="confirm_overwrite_no"):
+        st.session_state.pop("confirm_overwrite_name", None)
+        st.rerun()
 
 scenario_records = list_saved_scenarios()
 scenario_labels = [record["label"] for record in scenario_records]
@@ -2573,7 +3238,17 @@ if scenario_records:
         else:
             st.sidebar.error(f"Could not load '{load_name}'")
 
-    st.sidebar.caption("Selecting a saved scenario loads it automatically.")
+    _del_col1, _del_col2 = st.sidebar.columns([3, 1])
+    _del_col1.caption("Selecting a saved scenario loads it automatically.")
+    if _del_col2.button("🗑", help=f"Delete '{load_name}'", key="delete_scenario_btn"):
+        delete_scenario(load_name)
+        st.session_state.scenario_flash_message = {
+            "level": "success",
+            "text": f"Deleted {load_name}",
+        }
+        st.session_state.pop("selected_scenario_label", None)
+        st.session_state.saved_scenario_selector_prev = None
+        st.rerun()
 else:
     load_name = None
     st.sidebar.info("No saved scenarios found in saved_scenarios yet.")
@@ -2863,6 +3538,19 @@ else:
             st.session_state.selected_aoi_payload = aoi_payload
             st.session_state.selected_aoi_name = aoi_payload["name"]
             st.caption("Standard example uses a square AOI so you can compare option changes on a common 100 km²-style block.")
+
+            # ── Coverage buffer ───────────────────────────────────────────────
+            st.markdown("**Coverage buffer**")
+            aoi_buffer_m = st.number_input(
+                f"Buffer distance ({dist_unit})",
+                min_value=0.0,
+                max_value=m_to_unit(10000.0, dist_unit),
+                value=m_to_unit(500.0, dist_unit),
+                step=m_to_unit(100.0, dist_unit),
+                key="aoi_buffer_display",
+                help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage.",
+            )
+            aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
         else:
             kml_files = list_library_kmls()
             if not kml_files:
@@ -2885,6 +3573,24 @@ else:
                 if st.session_state.get("selected_aoi_payload") is not None:
                     aoi_payload = st.session_state.selected_aoi_payload
                     st.caption(f"Loaded AOI: {st.session_state.get('selected_aoi_name', aoi_payload.get('name', 'KML'))}")
+
+            # ── Coverage buffer ───────────────────────────────────────────────
+            st.markdown("**Coverage buffer**")
+            _buf_col1, _buf_col2 = st.columns([2, 1])
+            aoi_buffer_m = _buf_col1.number_input(
+                f"Buffer distance ({dist_unit})",
+                min_value=0.0,
+                max_value=m_to_unit(10000.0, dist_unit),
+                value=m_to_unit(500.0, dist_unit),
+                step=m_to_unit(100.0, dist_unit),
+                key="aoi_buffer_display",
+                help="Flight lines extend this distance beyond the AOI boundary to ensure full coverage of the edge. "
+                     "Default 500 m ensures the outermost oblique cameras fully cover the AOI perimeter.",
+            )
+            aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
+            _buf_col2.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+            if aoi_buffer_m > 0:
+                _buf_col2.caption(f"≈ {aoi_buffer_m:.0f} m buffer")
 
     with controls_right:
         optimize_flight_direction = st.checkbox(
@@ -2941,9 +3647,26 @@ else:
         storage_per_image_mb = STORAGE_PROFILE_OPTIONS[storage_profile_label]
 
     if aoi_payload is not None:
+        # Apply coverage buffer — expand AOI before flight line generation
+        _aoi_buffer_m = float(st.session_state.get("aoi_buffer_m_internal", 500.0))
+        _aoi_for_planning = build_buffered_aoi(aoi_payload, _aoi_buffer_m)
+
+        # Compute actual along-track footprint reach from camera solutions
+        _along_reach = 0.0
+        for _cam_s, _sol_s, _ in solutions:
+            try:
+                _fp = camera_polygon(_sol_s)
+                if _fp:
+                    _along_reach = max(_along_reach,
+                                       max(abs(c[1]) for c in _fp if math.isfinite(c[1])))
+            except Exception:
+                pass
+        if _along_reach <= 0:
+            _along_reach = mc.recommended_photo_spacing_m * 1.5
+
         if optimize_flight_direction:
             mission_outputs = optimize_aoi_flight_direction(
-                aoi_payload=aoi_payload,
+                aoi_payload=_aoi_for_planning,
                 line_spacing_m=mc.recommended_line_spacing_m,
                 photo_spacing_m=mc.recommended_photo_spacing_m,
                 speed_ms=speed_ms,
@@ -2953,10 +3676,11 @@ else:
                 search_step_deg=search_step_deg,
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
+                along_track_reach_m=_along_reach,
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
-                aoi_payload=aoi_payload,
+                aoi_payload=_aoi_for_planning,
                 line_spacing_m=mc.recommended_line_spacing_m,
                 photo_spacing_m=mc.recommended_photo_spacing_m,
                 speed_ms=speed_ms,
@@ -2966,7 +3690,11 @@ else:
                 turn_time_per_line_min=turn_time_per_line_min,
                 storage_profile_label=storage_profile_label,
                 storage_per_image_mb=storage_per_image_mb,
+                along_track_reach_m=_along_reach,
             )
+
+    # Store original unbuffered polygon for map overlay
+    _original_aoi_poly = aoi_payload.get("polygon") if aoi_payload else None
 
     if mission_outputs is not None:
         m1, m2, m3, m4 = st.columns(4)
@@ -2981,6 +3709,16 @@ else:
         m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
         m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 3600.0:.2f} hr")
 
+        # Coverage QA
+        _cov_pct = mission_outputs.get("coverage_pct")
+        if _cov_pct is not None:
+            _cov_col = "normal" if _cov_pct >= 99.0 else ("off" if _cov_pct >= 95.0 else "inverse")
+            _cov_icon = "✅" if _cov_pct >= 99.0 else ("⚠️" if _cov_pct >= 95.0 else "❌")
+            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of AOI area** — "
+                    + ("Full coverage achieved." if _cov_pct >= 99.0
+                       else f"Partial coverage — {100-_cov_pct:.1f}% of AOI may be missed. "
+                            "Try reducing line spacing or adjusting flight azimuth."))
+
         optimized_note = ""
         if mission_outputs.get("flight_direction_optimized"):
             optimized_note = (
@@ -2993,6 +3731,7 @@ else:
             f"Flying time includes {mission_outputs['total_turn_time_s'] / 60.0:.0f} min total turn allowance based on {mission_outputs['turn_time_per_line_s'] / 60.0:.1f} min between consecutive runs. "
             f"Storage assumes a camera-aware {mission_outputs.get('storage_profile_label', 'Uncompressed RAW')} estimate averaging {mission_outputs.get('storage_per_image_mb', 130.0):.1f} MB/image across the enabled cameras." 
             f"{optimized_note}"
+            + (f" Coverage buffer: {_aoi_buffer_m:.0f} m applied beyond original AOI boundary." if _aoi_buffer_m > 0 else "")
         )
 
         _bm_col1, _bm_col2 = st.columns([1, 2])
@@ -3016,9 +3755,16 @@ else:
                     key="aoi_basemap_style",
                     format_func=lambda x: "OpenStreetMap" if x == "osm" else "Satellite (Esri)",
                 )
-        aoi_fig = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
-                                           show_basemap=_show_basemap,
-                                           basemap_style=_basemap_style)
+        _fig_result = make_aoi_mission_figure(mission_outputs, dist_unit=dist_unit,
+                                              show_basemap=_show_basemap,
+                                              basemap_style=_basemap_style,
+                                              original_aoi_poly=_original_aoi_poly)
+        if isinstance(_fig_result, tuple):
+            aoi_fig, _basemap_err = _fig_result
+        else:
+            aoi_fig, _basemap_err = _fig_result, None
+        if _basemap_err and _show_basemap:
+            st.caption(f"ℹ️ {_basemap_err}")
         if aoi_fig is not None:
             aoi_left, aoi_mid, aoi_right = st.columns([1.2, 2.6, 1.2])
             with aoi_mid:
@@ -3059,8 +3805,8 @@ ax_fp.set_xlim(-lim, lim)
 ax_fp.set_ylim(-lim, lim)
 
 # Grid / nadir
-ax_fp.axhline(0, color="#21262d", lw=0.8, zorder=1)
-ax_fp.axvline(0, color="#21262d", lw=0.8, zorder=1)
+ax_fp.axhline(0, color="#243447", lw=0.8, zorder=1)
+ax_fp.axvline(0, color="#243447", lw=0.8, zorder=1)
 ax_fp.scatter([0], [0], s=200, color="#f0c040", zorder=8, marker="x", linewidths=2.5)
 ax_fp.annotate("Nadir", (0, 0), xytext=(8, -14), textcoords="offset points",
                color="#f0c040", fontsize=8.5, fontweight="bold")
@@ -3094,13 +3840,13 @@ for cam, sol, colour in solutions:
         ha="center",
         va="center",
         zorder=7,
-        bbox=dict(facecolor="#0d1117", alpha=0.70, pad=2.5, edgecolor=colour, linewidth=0.8, boxstyle="round,pad=0.3"),
+        bbox=dict(facecolor="#1a2332", alpha=0.70, pad=2.5, edgecolor=colour, linewidth=0.8, boxstyle="round,pad=0.3"),
     )
 
     inner_gx, outer_gx = corner_inner_outer(sol)
     inner_len, outer_len = along_lengths_for_display(sol)
     (it, ib), (ot, ob) = inner_outer_corners(sol)
-    label_box = dict(facecolor="#0d1117", alpha=0.82, edgecolor=colour, linewidth=0.6, boxstyle="round,pad=0.18")
+    label_box = dict(facecolor="#1a2332", alpha=0.82, edgecolor=colour, linewidth=0.6, boxstyle="round,pad=0.18")
 
     if sol.tilt_axis == "across":
         ap = dict(arrowstyle="-|>", lw=1.3, mutation_scale=11)
@@ -3236,7 +3982,7 @@ ax_fp.set_title("Single-Frame Footprint Plan View — All Cameras", color="#c9d1
 legend_fp = [mpatches.Patch(color=col, label=cam["label"], alpha=0.85)
              for cam, _, col in solutions]
 ax_fp.legend(handles=legend_fp, loc="upper right", fontsize=8, framealpha=0.4,
-             labelcolor="#c9d1d9", facecolor="#161b22")
+             labelcolor="#c9d1d9", facecolor="#1e2d40")
 
 # Forward arrow
 ax_fp.annotate("", xy=(0, lim * 0.90), xytext=(0, lim * 0.74),
@@ -3340,7 +4086,7 @@ if across_sols:
         plt.Line2D([0],[0], color="white", ls="--", lw=1.4, label="Outer edge ray"),
     ]
     ax_xs.legend(handles=legend_xs, fontsize=7, framealpha=0.35,
-                 labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right", ncol=2)
+                 labelcolor="#c9d1d9", facecolor="#1e2d40", loc="upper right", ncol=2)
 
     fig_xs.tight_layout()
     st.pyplot(fig_xs)
@@ -3466,7 +4212,7 @@ if mc and multistrip_solutions:
             fontsize=7,
             ha="center",
             va="bottom",
-            bbox=dict(facecolor="#21262d", alpha=0.80, pad=3, edgecolor="#c9d1d9", lw=0.6),
+            bbox=dict(facecolor="#243447", alpha=0.80, pad=3, edgecolor="#c9d1d9", lw=0.6),
             zorder=6,
         )
 
@@ -3489,7 +4235,7 @@ if mc and multistrip_solutions:
             fontsize=8,
             ha="center",
             va="top",
-            bbox=dict(facecolor="#21262d", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
+            bbox=dict(facecolor="#243447", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
         )
 
         x_for_photo = min(all_x_ms) - 0.06 * x_range
@@ -3508,7 +4254,7 @@ if mc and multistrip_solutions:
             fontsize=8,
             ha="left",
             va="center",
-            bbox=dict(facecolor="#21262d", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
+            bbox=dict(facecolor="#243447", alpha=0.75, pad=3, edgecolor="#555", lw=0.5),
         )
 
         x_min = min(all_x_ms) - 0.12 * x_range
@@ -3532,7 +4278,7 @@ if mc and multistrip_solutions:
     legend_ms = [mpatches.Patch(color=col, label=cam["label"], alpha=0.8)
                  for cam, _, col in multistrip_solutions]
     ax_ms.legend(handles=legend_ms, fontsize=8, framealpha=0.35,
-                 labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right")
+                 labelcolor="#c9d1d9", facecolor="#1e2d40", loc="upper right")
 
     fig_ms.tight_layout()
     st.pyplot(fig_ms)
@@ -4092,8 +4838,9 @@ st.subheader("Export Results")
 report_figures = [("Footprint plan view", fig_to_png_bytes(fig_fp))]
 if across_sols:
     report_figures.append(("Cross-section view", fig_to_png_bytes(fig_xs)))
-if mc and multistrip_solutions:
-    report_figures.append(("Multi-strip plan view", fig_to_png_bytes(fig_ms)))
+# Multi-strip is exported separately as the 6-trigger version — skip from report_figures
+# if mc and multistrip_solutions:
+#     report_figures.append(("Multi-strip plan view", fig_to_png_bytes(fig_ms)))
 if coverage_fig_hits is not None:
     report_figures.append(("Point coverage heatmap - image hits", fig_to_png_bytes(coverage_fig_hits)))
 if coverage_fig_angles is not None:
@@ -4102,7 +4849,7 @@ if coverage_fig_angles is not None:
 mission_rows = build_mission_export_rows(mission_outputs, dist_unit=dist_unit) if mission_outputs is not None else []
 mission_figure_bytes = fig_to_png_bytes(aoi_fig) if aoi_fig is not None else None
 
-col_exp1, col_exp2 = st.columns(2)
+col_exp1, col_exp2, col_exp3 = st.columns(3)
 with col_exp1:
     excel_bytes = make_excel_export(
         settings_rows,
@@ -4118,6 +4865,39 @@ with col_exp1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 with col_exp2:
+    # Generate a 6-trigger version of the multi-strip figure for the Word report
+    _fig_ms_6trigger_bytes = None
+    if mc and multistrip_solutions:
+        try:
+            _fig_ms6, _ax_ms6 = dark_fig(14, 8)
+            _ax_ms6.set_aspect("equal")
+            _line_sp6, _photo_sp6, _ = fallback_multistrip_spacing(
+                multistrip_solutions, fwd_frac=fwd_frac, side_frac=side_frac, mc=mc
+            )
+            _frame_offsets_6 = [_photo_sp6 * idx for idx in range(6)]
+            _strip_offsets_6 = [-_line_sp6, 0.0, _line_sp6]
+            for _strip_dx in _strip_offsets_6:
+                for _cam6, _sol6, _col6 in multistrip_solutions:
+                    _poly6 = camera_polygon(_sol6)
+                    for _fy in _frame_offsets_6:
+                        _shifted6 = [(_px + _strip_dx, _py + _fy) for _px, _py in _poly6]
+                        if all(math.isfinite(v) for xy in _shifted6 for v in xy):
+                            _xs6 = [p[0] for p in _shifted6] + [_shifted6[0][0]]
+                            _ys6 = [p[1] for p in _shifted6] + [_shifted6[0][1]]
+                            _ax_ms6.fill(_xs6, _ys6, color=_col6, alpha=0.10, zorder=2)
+                            _ax_ms6.plot(_xs6, _ys6, color=_col6, lw=0.6, alpha=0.7, zorder=3)
+            _ax_ms6.axhline(0, color="#8b949e", lw=0.8, ls="--", alpha=0.5)
+            _ax_ms6.set_xlabel(f"Across-track ({dist_unit})", color="#8b949e", fontsize=8)
+            _ax_ms6.set_ylabel(f"Along-track ({dist_unit})", color="#8b949e", fontsize=8)
+            _ax_ms6.set_title("Multi-strip — 6 trigger instances", color="#c9d1d9", fontsize=10)
+            _fig_ms6.tight_layout()
+            _fig_ms_6trigger_bytes = fig_to_png_bytes(_fig_ms6)
+            plt.close(_fig_ms6)
+        except Exception:
+            _fig_ms_6trigger_bytes = None
+
+    _coverage_export = coverage_summary(coverage_result) if coverage_result is not None else None
+
     word_bytes = make_word_export(
         settings_rows,
         system_rows,
@@ -4125,6 +4905,8 @@ with col_exp2:
         mission_rows=mission_rows,
         mission_figure_bytes=mission_figure_bytes,
         report_figures=report_figures,
+        coverage_summary_data=_coverage_export,
+        fig_ms_6trigger_bytes=_fig_ms_6trigger_bytes,
     )
     st.download_button(
         label="Download Word client report",
@@ -4132,6 +4914,19 @@ with col_exp2:
         file_name="oblique_planner_report.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+with col_exp3:
+    _kml_bytes = make_kml_export(mission_outputs, solutions=solutions) if mission_outputs is not None else None
+    if _kml_bytes is not None:
+        _kml_name = f"{mission_outputs.get('name', 'flight_plan').replace(' ', '_')}_flight_plan.kml"
+        st.download_button(
+            label="Download KML flight plan",
+            data=_kml_bytes,
+            file_name=_kml_name,
+            mime="application/vnd.google-earth.kml+xml",
+        )
+    else:
+        st.info("Load a KML file in the AOI section to enable flight plan KML export.")
 
 st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
