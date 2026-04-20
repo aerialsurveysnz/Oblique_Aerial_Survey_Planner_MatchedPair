@@ -2528,283 +2528,187 @@ def estimate_camera_file_size_mb(cam, storage_profile_label="Uncompressed RAW", 
     return float(uncompressed_mb * ratio)
 
 
-def compute_aoi_mission_outputs(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, swath_m=None):
-    if not SHAPELY_AVAILABLE:
-        return None
-    if aoi_payload is None:
+def compute_aoi_mission_outputs(
+    aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras,
+    flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0,
+    storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0,
+    along_track_reach_m=None, swath_m=None,
+):
+    """Generate flight line segments and mission statistics for an AOI.
+
+    Design principles:
+    - polygon = the planning polygon (may be buffered beyond the client AOI)
+    - original_polygon = the client AOI that must be 100% covered
+    - Lines are clipped to the planning polygon intersection at each x offset
+    - Each line is extended fore/aft by (lead_in + along_track_reach) beyond
+      the intersection boundary, ensuring oblique footprints reach the AOI edge
+    - Water gaps wider than 3× line_spacing split a line into separate segments
+    - Coverage QA is measured against the original (unbuffered) client AOI
+    """
+    if not SHAPELY_AVAILABLE or aoi_payload is None:
         return None
     polygon = aoi_payload.get("polygon")
     if polygon is None or getattr(polygon, "is_empty", True):
         return None
-    if not (np.isfinite(line_spacing_m) and line_spacing_m > 0 and np.isfinite(photo_spacing_m) and photo_spacing_m > 0):
+    if not (np.isfinite(line_spacing_m) and line_spacing_m > 0
+            and np.isfinite(photo_spacing_m) and photo_spacing_m > 0):
         return None
 
     turn_time_per_line_s = max(float(turn_time_per_line_min), 0.0) * 60.0
+    lead_in  = max(float(lead_in_out_m), 0.0)
+    # Along-track footprint reach — how far fore/aft obliques see beyond nadir
+    along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
 
-    rotated = shapely_rotate(polygon, float(flight_azimuth_deg), origin="centroid", use_radians=False)
-
-    # Note: we intentionally do NOT simplify the rotated polygon here.
-    # Simplification can shift edge vertices inward and cause flight lines
-    # to miss the AOI boundary. The polygon is already simplified at parse
-    # time (parse_kml_aoi) which is sufficient for speed.
-
+    # ── Rotate polygon into flight-line frame (lines become vertical) ─────────
+    rotated = shapely_rotate(polygon, float(flight_azimuth_deg),
+                             origin="centroid", use_radians=False)
     minx, miny, maxx, maxy = rotated.bounds
     width = maxx - minx
     if not np.isfinite(width) or width < 0:
         return None
 
-    # Generate offsets that fully span minx..maxx with one extra line on each
-    # side so partial-width edge strips are never missed.
-    n_candidates = max(1, int(math.ceil(width / line_spacing_m)) + 2)
-    # Start half a spacing before minx so edge of AOI is always covered
-    start_x = minx - (line_spacing_m * 0.5)
-    offsets = [start_x + i * line_spacing_m for i in range(n_candidates + 1)]
-    # Keep only those within the AOI bounds (plus one line width margin)
-    offsets = [x for x in offsets if x <= maxx + line_spacing_m]
-    pad = max(maxy - miny, 1.0) + max(float(lead_in_out_m), 0.0) + 1000.0
-    # Along-track extension: ensures fore/aft footprints reach the AOI boundary.
-    # Use actual camera along-track reach if provided, else photo_spacing proxy.
-    _max_along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
+    # ── Generate x-offsets for flight lines ──────────────────────────────────
+    # Start half a spacing before minx so the AOI left edge is always covered.
+    # Add extra lines on both sides — filtered to those that intersect the AOI.
+    n = max(1, int(math.ceil(width / line_spacing_m)) + 2)
+    start_x = minx - line_spacing_m * 0.5
+    offsets = [start_x + i * line_spacing_m for i in range(n + 1)]
+    offsets = [x for x in offsets if minx - line_spacing_m <= x <= maxx + line_spacing_m]
 
-    # Pre-compute original AOI bounds in rotated frame for line end clamping.
-    # Use the original polygon's own centroid as rotation origin for accuracy.
-    try:
-        _orig_poly = aoi_payload.get("original_polygon") or polygon
-        _orig_rot = shapely_rotate(
-            _orig_poly, float(flight_azimuth_deg), origin=_orig_poly.centroid, use_radians=False
-        )
-        _ob = _orig_rot.bounds  # (minx, miny, maxx, maxy)
-        # The rotated bounds may be in a different coordinate frame than the
-        # buffered polygon — align them by using the same rotation origin (polygon.centroid)
-        _orig_rot2 = shapely_rotate(
-            _orig_poly, float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False
-        )
-        _orig_rotated_bounds = _orig_rot2.bounds
-    except Exception:
-        _orig_rotated_bounds = (minx, miny, maxx, maxy)
+    # Pad for intersection test — tall enough to span the whole rotated polygon
+    pad = (maxy - miny) + lead_in + 1000.0
 
+    # Water gap threshold — gaps wider than this split a line into segments
+    water_gap = line_spacing_m * 3.0
+
+    # ── Build flight line segments ────────────────────────────────────────────
+    raw_segments = []
     line_count = 0
     total_line_length_m = 0.0
     total_exposures = 0
     line_lengths_m = []
-    raw_segments = []   # store segments so we don't intersect twice
 
-    # Flight lines run the full bounding-box height without clipping to the
-    # AOI polygon. This ensures complete coverage along irregular coastlines
-    # and concave boundaries — the buffer zone is automatically included.
-    # We only generate a line if it intersects the AOI (to avoid lines far
-    # outside the area), but the line itself is not clipped.
     for x in offsets:
-        base_line = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
-        # Check if this x position intersects the AOI at all
-        if not rotated.intersects(base_line):
+        # Intersect vertical test line with rotated AOI polygon
+        test = ShapelyLineString([(x, miny - pad), (x, maxy + pad)])
+        if not rotated.intersects(test):
             continue
-        # Get the intersection to determine the actual extent of the line
-        # within the AOI — used for start/end points only
-        intersection = rotated.intersection(base_line)
-        segs = list(iter_line_geometries(intersection))
+        intersection = rotated.intersection(test)
+        segs = sorted(iter_line_geometries(intersection),
+                      key=lambda s: list(s.coords)[0][1])
         if not segs:
             continue
-        # Sort segments by y position
-        segs_sorted = sorted(segs, key=lambda s: list(s.coords)[0][1])
-        # Water gap threshold: if gap between segments > 3x line_spacing, split
-        # so we don't fly long stretches over open water
-        water_gap_threshold = line_spacing_m * 3.0
 
-        # Group consecutive segments that are close together
-        groups = []
-        current_group = [segs_sorted[0]]
-        for seg_i in segs_sorted[1:]:
-            prev_end   = max(c[1] for c in list(current_group[-1].coords))
-            this_start = min(c[1] for c in list(seg_i.coords))
-            if (this_start - prev_end) > water_gap_threshold:
-                groups.append(current_group)
-                current_group = [seg_i]
+        # Group segments — bridge small water gaps, split large ones
+        groups = [[segs[0]]]
+        for seg in segs[1:]:
+            prev_y1 = max(c[1] for c in list(groups[-1][-1].coords))
+            this_y0 = min(c[1] for c in list(seg.coords))
+            if this_y0 - prev_y1 > water_gap:
+                groups.append([seg])   # new group = separate flight line
             else:
-                current_group.append(seg_i)
-        groups.append(current_group)
+                groups[-1].append(seg) # same group = bridge the gap
 
-        # Create one flight line per group
         for group in groups:
-            all_coords = []
+            pts = []
             for gs in group:
-                all_coords.extend(list(gs.coords))
-            if len(all_coords) < 2:
+                pts.extend(list(gs.coords))
+            pts.sort(key=lambda c: c[1])
+
+            # Extend beyond AOI boundary by lead-in + along-track footprint reach
+            y0 = pts[0][1]  - lead_in - along_reach
+            y1 = pts[-1][1] + lead_in + along_reach
+            seg_len = y1 - y0
+            if seg_len <= 0:
                 continue
-            all_coords.sort(key=lambda c: c[1])
-            # Line ends: extend by lead-in + along-track reach from the AOI intersection.
-            # Ensure lines always reach original AOI boundary + footprint reach.
-            # Cap at buffered AOI bounds + lead-in to prevent excessive water overfly.
-            _extend = max(float(lead_in_out_m), 0.0) + _max_along_reach
-            # Start from intersection points
-            _raw_y0 = all_coords[0][1] - _extend
-            _raw_y1 = all_coords[-1][1] + _extend
-            # Must reach original AOI top/bottom (+ footprint reach)
-            _orig_y0_req = _orig_rotated_bounds[1] - _max_along_reach - max(float(lead_in_out_m), 0.0)
-            _orig_y1_req = _orig_rotated_bounds[3] + _max_along_reach + max(float(lead_in_out_m), 0.0)
-            # Take the more generous of intersection-based vs original-AOI-based
-            y_start = min(_raw_y0, _orig_y0_req)
-            y_end   = max(_raw_y1, _orig_y1_req)
-            # Hard cap: buffered polygon bounds + lead-in (stops water overfly)
-            y_start = max(y_start, miny - max(float(lead_in_out_m), 0.0) * 2)
-            y_end   = min(y_end,   maxy + max(float(lead_in_out_m), 0.0) * 2)
-            full_seg = ShapelyLineString([(x, y_start), (x, y_end)])
-            seg_length = float(full_seg.length)
-            if seg_length <= 0:
-                continue
+
+            raw_segments.append(ShapelyLineString([(x, y0), (x, y1)]))
             line_count += 1
-            total_line_length_m += seg_length
-            line_lengths_m.append(seg_length)
-            total_exposures += max(1, int(math.ceil(seg_length / photo_spacing_m)) + 1)
-            raw_segments.append(full_seg)
+            total_line_length_m += seg_len
+            line_lengths_m.append(seg_len)
+            total_exposures += max(1, int(math.ceil(seg_len / photo_spacing_m)) + 1)
 
-    # ── Coverage guarantee for original (unbuffered) AOI ─────────────────────
-    # After generating all flight line segments, check that the original AOI
-    # boundary is fully covered. If any part of the original AOI extends beyond
-    # the current line ends, extend those line ends to cover it.
-    # This ensures the buffer achieves its purpose — the original AOI is always
-    # fully covered regardless of its shape.
-    original_polygon = aoi_payload.get("original_polygon")
-    if original_polygon is not None and not getattr(original_polygon, "is_empty", True) and SHAPELY_AVAILABLE:
-        try:
-            # Rotate original polygon into flight line coordinate frame
-            orig_rotated = shapely_rotate(original_polygon, float(flight_azimuth_deg),
-                                          origin=polygon.centroid, use_radians=False)
-            orig_minx, orig_miny, orig_maxx, orig_maxy = orig_rotated.bounds
-
-            # For each flight line segment, check if it covers the original AOI
-            # extent at that x position, and extend if not
-            extended_segments = []
-            for seg in raw_segments:
-                coords = list(seg.coords)
-                if len(coords) < 2:
-                    extended_segments.append(seg)
-                    continue
-                sx = coords[0][0]  # x position of this line
-                sy0 = min(c[1] for c in coords)
-                sy1 = max(c[1] for c in coords)
-
-                # Check what the original AOI requires at this x position
-                test_line = ShapelyLineString([(sx, orig_miny - 1), (sx, orig_maxy + 1)])
-                if orig_rotated.intersects(test_line):
-                    orig_intersection = orig_rotated.intersection(test_line)
-                    orig_segs = list(iter_line_geometries(orig_intersection))
-                    if orig_segs:
-                        all_orig = []
-                        for os_ in orig_segs:
-                            all_orig.extend(list(os_.coords))
-                        orig_y0 = min(c[1] for c in all_orig) - _max_along_reach
-                        orig_y1 = max(c[1] for c in all_orig) + _max_along_reach
-                        # Extend if original AOI needs more coverage
-                        new_y0 = min(sy0, orig_y0)
-                        new_y1 = max(sy1, orig_y1)
-                        if new_y0 < sy0 or new_y1 > sy1:
-                            seg = ShapelyLineString([(sx, new_y0), (sx, new_y1)])
-                extended_segments.append(seg)
-            raw_segments = extended_segments
-        except Exception:
-            pass  # If check fails, keep original segments
-
-    enabled_cam_count = max(1, len(enabled_cameras))
-    total_images = total_exposures * enabled_cam_count
-    per_camera_storage_mb = [
-        estimate_camera_file_size_mb(cam, storage_profile_label=storage_profile_label, storage_per_image_mb=storage_per_image_mb)
-        for cam in enabled_cameras
-    ]
-    per_trigger_storage_mb = sum(per_camera_storage_mb)
-    storage_per_image_mb = (per_trigger_storage_mb / enabled_cam_count) if enabled_cam_count > 0 else float(storage_per_image_mb)
-    total_storage_mb = total_exposures * per_trigger_storage_mb
-    airborne_time_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
-    total_turn_time_s = max(line_count - 1, 0) * turn_time_per_line_s
-    flight_time_s = airborne_time_s + total_turn_time_s if np.isfinite(airborne_time_s) else float("nan")
-
+    # ── Rotate segments back to geographic orientation ────────────────────────
     mission_line_geometries = []
     for seg in raw_segments:
-        # Segments already include lead-in/out — just rotate back to original coords
         try:
             mission_line_geometries.append(
-                shapely_rotate(seg, -float(flight_azimuth_deg), origin=polygon.centroid, use_radians=False)
+                shapely_rotate(seg, -float(flight_azimuth_deg),
+                               origin=polygon.centroid, use_radians=False)
             )
         except Exception:
             continue
 
-    # ── Coverage QA: check what fraction of ORIGINAL (unbuffered) AOI is covered
-    # Always measure against the original client AOI, not the buffer zone.
+    # ── Storage and time estimates ────────────────────────────────────────────
+    enabled_cam_count = max(1, len(enabled_cameras))
+    per_cam_mb = [
+        estimate_camera_file_size_mb(cam, storage_profile_label=storage_profile_label,
+                                     storage_per_image_mb=storage_per_image_mb)
+        for cam in enabled_cameras
+    ]
+    per_trigger_mb = sum(per_cam_mb)
+    storage_per_image_mb = (per_trigger_mb / enabled_cam_count) if enabled_cam_count else float(storage_per_image_mb)
+    total_storage_mb = total_exposures * per_trigger_mb
+    airborne_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
+    turn_s     = max(line_count - 1, 0) * turn_time_per_line_s
+    flight_s   = airborne_s + turn_s if np.isfinite(airborne_s) else float("nan")
+
+    # ── Coverage QA against original (unbuffered) client AOI ─────────────────
+    # Use swath_m/2 as strip half-width — a point is covered if any flight line
+    # nadir passes within swath_m/2 of it (oblique cameras cover the full swath).
     coverage_pct = None
     try:
-        if SHAPELY_AVAILABLE and raw_segments and line_spacing_m > 0:
-            # Use original polygon if available (pre-buffer), else use planning polygon
-            _check_poly = (aoi_payload.get("original_polygon") or polygon)
-            # Use actual swath width if provided, else fall back to line spacing
-            # Swath width > line spacing (that's how overlap works) so this gives
-            # accurate coverage including the oblique cameras' full across-track reach
-            _strip_half_w = (float(swath_m) / 2.0) if swath_m and float(swath_m) > line_spacing_m else (line_spacing_m / 2.0)
-            strips = []
-            for seg in raw_segments:
-                coords = list(seg.coords)
-                if len(coords) >= 2:
-                    strips.append(seg.buffer(_strip_half_w, cap_style=2))
-            if strips:
-                covered = unary_union(strips)
-                # Rotate back to original orientation
-                covered_orig = shapely_rotate(
-                    covered, -float(flight_azimuth_deg),
-                    origin=polygon.centroid, use_radians=False
-                )
-                # Use the original AOI polygon for coverage check
-                # Slightly shrink check polygon by 1m to avoid floating point edge issues
-                try:
-                    check_shrunk = _check_poly.buffer(-1.0)
-                    check_area = check_shrunk.area
-                    if check_area <= 0:
-                        check_shrunk = _check_poly
-                        check_area = _check_poly.area
-                except Exception:
-                    check_shrunk = _check_poly
-                    check_area = _check_poly.area
-                intersection_area = check_shrunk.intersection(covered_orig).area
-                if check_area > 0:
-                    coverage_pct = round(100.0 * intersection_area / check_area, 1)
+        check_poly = aoi_payload.get("original_polygon") or polygon
+        half_w = (float(swath_m) / 2.0) if (swath_m and float(swath_m) > 0) else (line_spacing_m / 2.0)
+        strips = [seg.buffer(half_w, cap_style=2) for seg in raw_segments
+                  if len(list(seg.coords)) >= 2]
+        if strips:
+            covered = shapely_rotate(
+                unary_union(strips), -float(flight_azimuth_deg),
+                origin=polygon.centroid, use_radians=False
+            )
+            check = check_poly.buffer(-1.0)  # shrink 1m to avoid boundary float errors
+            if check.is_empty or check.area <= 0:
+                check = check_poly
+            if check.area > 0:
+                coverage_pct = round(100.0 * check.intersection(covered).area / check.area, 1)
     except Exception:
         coverage_pct = None
 
     return {
-        "name": aoi_payload.get("name", "AOI"),
-        "source": aoi_payload.get("source", "unknown"),
-        "area_m2": float(aoi_payload.get("area_m2", polygon.area)),
-        "coverage_pct": coverage_pct,
-        "line_count": int(line_count),
-        "total_line_length_m": float(total_line_length_m),
-        "average_line_length_m": float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
-        "photo_spacing_m": float(photo_spacing_m),
-        "line_spacing_m": float(line_spacing_m),
-        "trigger_events": int(total_exposures),
-        "frames_per_camera": int(total_exposures),
-        "total_images": int(total_images),
-        "storage_profile_label": storage_profile_label,
-        "storage_per_image_mb": float(storage_per_image_mb),
-        "per_trigger_storage_mb": float(per_trigger_storage_mb),
-        "total_storage_mb": float(total_storage_mb),
-        "airborne_time_s": float(airborne_time_s),
-        "turn_time_per_line_s": float(turn_time_per_line_s),
-        "total_turn_time_s": float(total_turn_time_s),
-        "flight_time_s": float(flight_time_s),
-        "flight_azimuth_deg": float(flight_azimuth_deg),
-        "lead_in_out_m": float(lead_in_out_m),
+        "name":                   aoi_payload.get("name", "AOI"),
+        "source":                 aoi_payload.get("source", "unknown"),
+        "area_m2":                float(aoi_payload.get("area_m2", polygon.area)),
+        "coverage_pct":           coverage_pct,
+        "line_count":             int(line_count),
+        "total_line_length_m":    float(total_line_length_m),
+        "average_line_length_m":  float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
+        "photo_spacing_m":        float(photo_spacing_m),
+        "line_spacing_m":         float(line_spacing_m),
+        "trigger_events":         int(total_exposures),
+        "frames_per_camera":      int(total_exposures),
+        "total_images":           int(total_exposures * enabled_cam_count),
+        "storage_profile_label":  storage_profile_label,
+        "storage_per_image_mb":   float(storage_per_image_mb),
+        "per_trigger_storage_mb": float(per_trigger_mb),
+        "total_storage_mb":       float(total_storage_mb),
+        "airborne_time_s":        float(airborne_s),
+        "turn_time_per_line_s":   float(turn_time_per_line_s),
+        "total_turn_time_s":      float(turn_s),
+        "flight_time_s":          float(flight_s),
+        "flight_azimuth_deg":     float(flight_azimuth_deg),
+        "lead_in_out_m":          float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
-        "aoi_polygon": polygon,        # buffered polygon used for flight line generation
-        "original_aoi_polygon": (aoi_payload.get("original_polygon")  # original pre-buffer
-                                 or aoi_payload.get("polygon")),       # fallback if no buffer
-        # Geographic reference — passed through from aoi_payload so
-        # make_aoi_mission_figure can fetch map tiles for the correct location.
-        "lon0":      aoi_payload.get("lon0"),
-        "lat0":      aoi_payload.get("lat0"),
-        "mx0":       aoi_payload.get("mx0"),
-        "my0":       aoi_payload.get("my0"),
-        "lon_min":   aoi_payload.get("lon_min"),
-        "lon_max":   aoi_payload.get("lon_max"),
-        "lat_min":   aoi_payload.get("lat_min"),
-        "lat_max":   aoi_payload.get("lat_max"),
+        "aoi_polygon":            polygon,
+        "original_aoi_polygon":   (aoi_payload.get("original_polygon") or polygon),
+        "lon0":    aoi_payload.get("lon0"),
+        "lat0":    aoi_payload.get("lat0"),
+        "mx0":     aoi_payload.get("mx0"),
+        "my0":     aoi_payload.get("my0"),
+        "lon_min": aoi_payload.get("lon_min"),
+        "lon_max": aoi_payload.get("lon_max"),
+        "lat_min": aoi_payload.get("lat_min"),
+        "lat_max": aoi_payload.get("lat_max"),
         "buffered_m": aoi_payload.get("buffered_m", 0.0),
     }
 
@@ -3646,10 +3550,11 @@ else:
                 f"Buffer distance ({dist_unit})",
                 min_value=0.0,
                 max_value=m_to_unit(10000.0, dist_unit),
-                value=m_to_unit(500.0, dist_unit),
+                value=0.0,
                 step=m_to_unit(100.0, dist_unit),
                 key="aoi_buffer_display",
-                help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage.",
+                help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage. "
+                     "Standard example defaults to 0 — set a buffer when using a real KML AOI.",
             )
             aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
             st.session_state["aoi_buffer_m_internal"] = aoi_buffer_m
