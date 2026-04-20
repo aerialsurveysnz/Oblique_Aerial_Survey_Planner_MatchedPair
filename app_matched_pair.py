@@ -679,6 +679,233 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
     ]
 
 
+def make_kml_export(mission_outputs, solutions=None):
+    """Generate a KML file with AOI boundary, flight lines, photo points and footprints.
+
+    Flight lines and AOI polygon are stored in local Web Mercator offsets from
+    (mx0, my0).  This function converts them back to WGS84 lon/lat for KML.
+    solutions: list of (cam, sol, colour) from the planner — used for footprints.
+    Returns KML as bytes, or None if no geographic reference is available.
+    """
+    if mission_outputs is None:
+        return None
+
+    mx0 = mission_outputs.get("mx0")
+    my0 = mission_outputs.get("my0")
+    if mx0 is None or my0 is None:
+        return None
+
+    import math as _math
+    _R = 6378137.0
+
+    def _to_wgs84(lx, ly):
+        """Local Mercator offset (m) → WGS84 (lon, lat)."""
+        lon = _math.degrees((mx0 + lx) / _R)
+        lat = _math.degrees(2 * _math.atan(_math.exp((my0 + ly) / _R)) - _math.pi / 2)
+        return lon, lat
+
+    def _coords_str(pts):
+        """List of (x,y) local offsets → KML coordinates string."""
+        parts = []
+        for x, y in pts:
+            lon, lat = _to_wgs84(x, y)
+            parts.append(f"{lon:.8f},{lat:.8f},0")
+        return " ".join(parts)
+
+    name        = mission_outputs.get("name", "AOI")
+    azimuth     = float(mission_outputs.get("flight_azimuth_deg", 0.0))
+    line_count  = int(mission_outputs.get("line_count", 0))
+    line_sp_m   = float(mission_outputs.get("line_spacing_m", 0.0))
+    photo_sp_m  = float(mission_outputs.get("photo_spacing_m", 0.0))
+    total_km    = float(mission_outputs.get("total_line_length_m", 0.0)) / 1000.0
+    fly_hr      = float(mission_outputs.get("flight_time_s", 0.0)) / 3600.0
+
+    lines = []
+    lines.append('''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>''')
+    lines.append(f"  <name>{name} — Flight Plan</name>")
+    lines.append(f"""  <description>
+    AOI: {name}
+    Flight azimuth: {azimuth:.1f}°
+    Flight lines: {line_count}
+    Line spacing: {line_sp_m:.1f} m
+    Photo spacing: {photo_sp_m:.1f} m
+    Total line length: {total_km:.2f} km
+    Estimated flying time: {fly_hr:.2f} hr
+  </description>""")
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    lines.append("""  <Style id="aoi_style">
+    <LineStyle><color>ffff4444</color><width>2.5</width></LineStyle>
+    <PolyStyle><color>33ff4444</color></PolyStyle>
+  </Style>
+  <Style id="flightline_style">
+    <LineStyle><color>fff0c040</color><width>1.5</width></LineStyle>
+  </Style>
+  <Style id="flightline_odd_style">
+    <LineStyle><color>ff40c0f0</color><width>1.5</width></LineStyle>
+  </Style>""")
+
+    # ── AOI boundary polygon ──────────────────────────────────────────────────
+    aoi_poly = mission_outputs.get("aoi_polygon")
+    if aoi_poly is not None and not getattr(aoi_poly, "is_empty", True):
+        lines.append("""  <Folder><name>AOI Boundary</name>""")
+        geoms = [aoi_poly] if getattr(aoi_poly, "geom_type", "") == "Polygon" else list(getattr(aoi_poly, "geoms", []))
+        for geom in geoms:
+            if getattr(geom, "is_empty", True):
+                continue
+            outer = list(geom.exterior.coords)
+            outer_str = _coords_str(outer)
+            lines.append(f"""    <Placemark>
+      <name>AOI boundary</name>
+      <styleUrl>#aoi_style</styleUrl>
+      <Polygon>
+        <tessellate>1</tessellate>
+        <outerBoundaryIs><LinearRing>
+          <coordinates>{outer_str}</coordinates>
+        </LinearRing></outerBoundaryIs>""")
+            for interior in getattr(geom, "interiors", []):
+                inner_str = _coords_str(list(interior.coords))
+                lines.append(f"""        <innerBoundaryIs><LinearRing>
+          <coordinates>{inner_str}</coordinates>
+        </LinearRing></innerBoundaryIs>""")
+            lines.append("""      </Polygon>
+    </Placemark>""")
+        lines.append("""  </Folder>""")
+
+    # ── Flight lines ──────────────────────────────────────────────────────────
+    mission_line_geometries = mission_outputs.get("mission_line_geometries", [])
+    if mission_line_geometries:
+        lines.append("""  <Folder><name>Flight Lines</name>""")
+        for idx, line_geom in enumerate(mission_line_geometries, 1):
+            try:
+                coords = list(line_geom.coords)
+                if len(coords) < 2:
+                    continue
+                coord_str = _coords_str(coords)
+                style = "flightline_style" if idx % 2 == 1 else "flightline_odd_style"
+                lines.append(f"""    <Placemark>
+      <name>Line {idx}</name>
+      <styleUrl>#{style}</styleUrl>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>{coord_str}</coordinates>
+      </LineString>
+    </Placemark>""")
+            except Exception:
+                continue
+        lines.append("""  </Folder>""")
+
+    # ── Camera footprint styles (one per camera) ──────────────────────────────
+    # KML colour format: AABBGGRR
+    _cam_kml_cols = {
+        "nadir":   ("ff00ffff", "2200ffff"),
+        "right":   ("ff0000ff", "220000ff"),
+        "left":    ("ff00ff00", "2200ff00"),
+        "fore":    ("ffff00ff", "22ff00ff"),
+        "aft":     ("ff00e5ff", "2200e5ff"),
+        "default": ("fffff0c0", "22fff0c0"),
+    }
+
+    def _cam_kml_colour(label):
+        lbl = (label or "").lower()
+        for key in ("nadir", "right", "left", "fore", "aft"):
+            if key in lbl:
+                return _cam_kml_cols[key]
+        return _cam_kml_cols["default"]
+
+    if solutions:
+        for _cam, _sol, _ in solutions:
+            _lbl = (_sol.label or "camera")
+            _sid = _lbl.replace(" ", "_")
+            _lc, _fc = _cam_kml_colour(_lbl)
+            lines.append(f'''  <Style id="fp_{_sid}">
+    <LineStyle><color>{_lc}</color><width>1</width></LineStyle>
+    <PolyStyle><color>{_fc}</color></PolyStyle>
+  </Style>
+  <Style id="pt_{_sid}">
+    <IconStyle>
+      <color>{_lc}</color><scale>0.4</scale>
+      <Icon><href>http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon>
+    </IconStyle>
+    <LabelStyle><scale>0</scale></LabelStyle>
+  </Style>''')
+
+    # ── Photo points and footprints per camera ────────────────────────────────
+    photo_spacing_m = float(mission_outputs.get("photo_spacing_m", 0.0))
+
+    if solutions and mission_line_geometries and photo_spacing_m > 0:
+        import math as _m2
+        for _cam, _sol, _ in solutions:
+            _lbl = _sol.label or "Camera"
+            _sid = _lbl.replace(" ", "_")
+            try:
+                _fp_corners = camera_polygon(_sol)
+                if not _fp_corners or not all(_m2.isfinite(v) for xy in _fp_corners for v in xy):
+                    _fp_corners = None
+            except Exception:
+                _fp_corners = None
+
+            _pt_placemarks = []
+            _fp_placemarks = []
+
+            for line_geom in mission_line_geometries:
+                try:
+                    _lc2 = list(line_geom.coords)
+                    if len(_lc2) < 2:
+                        continue
+                    _x0, _y0 = _lc2[0]
+                    _x1, _y1 = _lc2[-1]
+                    _seg = _m2.hypot(_x1 - _x0, _y1 - _y0)
+                    if _seg < 1.0:
+                        continue
+                    _ux, _uy = (_x1-_x0)/_seg, (_y1-_y0)/_seg
+                    _ax, _ay = -_uy, _ux  # across-track unit vector
+                    _n = max(1, int(_m2.ceil(_seg / photo_spacing_m)) + 1)
+                    for _i in range(_n):
+                        _t = min(_i * photo_spacing_m, _seg)
+                        _cx = _x0 + _ux * _t
+                        _cy = _y0 + _uy * _t
+                        _lo, _la = _to_wgs84(_cx, _cy)
+                        _pt_placemarks.append(
+                            f'''    <Placemark><styleUrl>#pt_{_sid}</styleUrl>''' +
+                            f'''<Point><coordinates>{_lo:.8f},{_la:.8f},0</coordinates></Point></Placemark>'''
+                        )
+                        if _fp_corners:
+                            _fw = []
+                            for _fcx, _fcy in _fp_corners:
+                                _wx = _cx + _fcx * _ax + _fcy * _ux
+                                _wy = _cy + _fcx * _ay + _fcy * _uy
+                                _fw.append(_to_wgs84(_wx, _wy))
+                            _fw.append(_fw[0])
+                            _fcs = " ".join(f"{lo:.8f},{la:.8f},0" for lo, la in _fw)
+                            _fp_placemarks.append(f'''    <Placemark>
+      <styleUrl>#fp_{_sid}</styleUrl>
+      <Polygon><tessellate>1</tessellate>
+        <outerBoundaryIs><LinearRing>
+          <coordinates>{_fcs}</coordinates>
+        </LinearRing></outerBoundaryIs>
+      </Polygon>
+    </Placemark>''')
+                except Exception:
+                    continue
+
+            if _pt_placemarks:
+                lines.append(f'''  <Folder><n>Photo points — {_lbl}</n>''')
+                lines.extend(_pt_placemarks)
+                lines.append('''  </Folder>''')
+            if _fp_placemarks:
+                lines.append(f'''  <Folder><n>Photo footprints — {_lbl}</n>''')
+                lines.extend(_fp_placemarks)
+                lines.append('''  </Folder>''')
+
+    lines.append("""</Document>
+</kml>""")
+
+    return "\n".join(lines).encode("utf-8")
+
+
 def make_excel_export(settings_rows, system_rows, camera_rows, mission_rows=None, mission_figure_bytes=None):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, GradientFill
     from openpyxl.utils import get_column_letter
@@ -4303,7 +4530,7 @@ if coverage_fig_angles is not None:
 mission_rows = build_mission_export_rows(mission_outputs, dist_unit=dist_unit) if mission_outputs is not None else []
 mission_figure_bytes = fig_to_png_bytes(aoi_fig) if aoi_fig is not None else None
 
-col_exp1, col_exp2 = st.columns(2)
+col_exp1, col_exp2, col_exp3 = st.columns(3)
 with col_exp1:
     excel_bytes = make_excel_export(
         settings_rows,
@@ -4368,6 +4595,19 @@ with col_exp2:
         file_name="oblique_planner_report.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+with col_exp3:
+    _kml_bytes = make_kml_export(mission_outputs, solutions=solutions) if mission_outputs is not None else None
+    if _kml_bytes is not None:
+        _kml_name = f"{mission_outputs.get('name', 'flight_plan').replace(' ', '_')}_flight_plan.kml"
+        st.download_button(
+            label="Download KML flight plan",
+            data=_kml_bytes,
+            file_name=_kml_name,
+            mime="application/vnd.google-earth.kml+xml",
+        )
+    else:
+        st.info("Load a KML file in the AOI section to enable flight plan KML export.")
 
 st.markdown("---")
 # ─────────────────────────────────────────────────────────────────────────────
