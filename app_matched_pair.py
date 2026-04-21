@@ -739,6 +739,7 @@ def build_mission_export_rows(mission_outputs, dist_unit="m"):
         ["Storage per trigger", f"{per_trigger_storage_mb:.1f} MB"],
         ["Estimated storage", f"{float(mission_outputs.get('total_storage_mb', 0.0)) / 1024.0:.1f} GB"],
         ["Flight strip coverage", f"{mission_outputs.get('coverage_pct', '—')}%" if mission_outputs.get('coverage_pct') is not None else "—"],
+        ["Frame coverage", f"{mission_outputs.get('frame_coverage_pct', '—')}%" if mission_outputs.get('frame_coverage_pct') is not None else "—"],
         ["Airborne time", f"{float(mission_outputs.get('airborne_time_s', 0.0)) / 3600.0:.2f} hr"],
         ["Turn allowance", f"{float(mission_outputs.get('total_turn_time_s', 0.0)) / 3600.0:.2f} hr ({float(mission_outputs.get('turn_time_per_line_s', 0.0)) / 60.0:.0f} min per turn)"],
         ["Total flying time", f"{float(mission_outputs.get('flight_time_s', 0.0)) / 3600.0:.2f} hr (airborne + turns)"],
@@ -2532,7 +2533,7 @@ def compute_aoi_mission_outputs(
     aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras,
     flight_azimuth_deg=0.0, lead_in_out_m=150.0, turn_time_per_line_min=4.0,
     storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0,
-    along_track_reach_m=None, swath_m=None,
+    along_track_reach_m=None, swath_m=None, camera_solutions=None,
 ):
     """Generate flight line segments and mission statistics for an AOI.
 
@@ -2544,6 +2545,8 @@ def compute_aoi_mission_outputs(
       the intersection boundary, ensuring oblique footprints reach the AOI edge
     - Water gaps wider than 3× line_spacing split a line into separate segments
     - Coverage QA is measured against the original (unbuffered) client AOI
+    - Frame coverage uses actual camera footprint polygons at each trigger position
+      when camera_solutions are provided
     """
     if not SHAPELY_AVAILABLE or aoi_payload is None:
         return None
@@ -2654,11 +2657,15 @@ def compute_aoi_mission_outputs(
     flight_s   = airborne_s + turn_s if np.isfinite(airborne_s) else float("nan")
 
     # ── Coverage QA against original (unbuffered) client AOI ─────────────────
-    # Use swath_m/2 as strip half-width — a point is covered if any flight line
-    # nadir passes within swath_m/2 of it (oblique cameras cover the full swath).
+    # Two coverage checks:
+    #   1. Strip coverage — quick approximation using swath_m/2 buffers
+    #   2. Frame coverage — actual camera footprint polygons at trigger positions
+    # Frame coverage is the authoritative check when camera_solutions are given.
     coverage_pct = None
+    frame_coverage_pct = None
     try:
         check_poly = aoi_payload.get("original_polygon") or polygon
+        # --- Strip coverage (fast approximation) ---
         half_w = (float(swath_m) / 2.0) if (swath_m and float(swath_m) > 0) else (line_spacing_m / 2.0)
         strips = [seg.buffer(half_w, cap_style=2) for seg in raw_segments
                   if len(list(seg.coords)) >= 2]
@@ -2672,14 +2679,85 @@ def compute_aoi_mission_outputs(
                 check = check_poly
             if check.area > 0:
                 coverage_pct = round(100.0 * check.intersection(covered).area / check.area, 1)
+
+        # --- Frame coverage (actual camera footprints at each trigger) ---
+        if camera_solutions and raw_segments and photo_spacing_m > 0:
+            cam_footprints = []
+            for _cam_s, _sol_s, _ in camera_solutions:
+                fp = camera_polygon(_sol_s)
+                if fp and len(fp) >= 3 and all(math.isfinite(v) for xy in fp for v in xy):
+                    cam_footprints.append(fp)
+
+            if cam_footprints:
+                frame_polys = []
+                # Build trigger positions along each raw_segment (in rotated frame)
+                for seg in raw_segments:
+                    coords = list(seg.coords)
+                    if len(coords) < 2:
+                        continue
+                    x0, y0 = coords[0]
+                    x1, y1 = coords[-1]
+                    seg_len = math.hypot(x1 - x0, y1 - y0)
+                    if seg_len < 1:
+                        continue
+                    # Unit direction along the flight line (in rotated frame, lines are vertical)
+                    ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
+                    # Across direction (perpendicular)
+                    ax_d, ay_d = -uy, ux
+                    n_triggers = max(1, int(math.ceil(seg_len / photo_spacing_m)) + 1)
+                    for i in range(n_triggers):
+                        t = min(i * photo_spacing_m, seg_len)
+                        cx = x0 + ux * t
+                        cy = y0 + uy * t
+                        # Place each camera footprint at this trigger position
+                        for fp in cam_footprints:
+                            # fp corners are in camera local frame (across, along)
+                            # Rotate into flight-line frame: across -> ax_d, along -> ux/uy
+                            rotated_corners = [
+                                (cx + fcx * ax_d + fcy * ux,
+                                 cy + fcx * ay_d + fcy * uy)
+                                for fcx, fcy in fp
+                            ]
+                            try:
+                                fpoly = ShapelyPolygon(rotated_corners)
+                                if fpoly.is_valid and not fpoly.is_empty:
+                                    frame_polys.append(fpoly)
+                            except Exception:
+                                continue
+
+                if frame_polys:
+                    # Union all frame polygons (in rotated frame), then rotate back
+                    # Process in batches to avoid memory issues with very large missions
+                    _batch_size = 500
+                    _batched_unions = []
+                    for _bi in range(0, len(frame_polys), _batch_size):
+                        _batch = frame_polys[_bi:_bi + _batch_size]
+                        try:
+                            _batched_unions.append(unary_union(_batch))
+                        except Exception:
+                            continue
+                    if _batched_unions:
+                        frame_covered_rotated = unary_union(_batched_unions)
+                        frame_covered = shapely_rotate(
+                            frame_covered_rotated, -float(flight_azimuth_deg),
+                            origin=polygon.centroid, use_radians=False
+                        )
+                        check_f = check_poly.buffer(-1.0)
+                        if check_f.is_empty or check_f.area <= 0:
+                            check_f = check_poly
+                        if check_f.area > 0:
+                            frame_coverage_pct = round(
+                                100.0 * check_f.intersection(frame_covered).area / check_f.area, 1
+                            )
     except Exception:
-        coverage_pct = None
+        pass  # coverage_pct and frame_coverage_pct remain as set
 
     return {
         "name":                   aoi_payload.get("name", "AOI"),
         "source":                 aoi_payload.get("source", "unknown"),
         "area_m2":                float(aoi_payload.get("area_m2", polygon.area)),
         "coverage_pct":           coverage_pct,
+        "frame_coverage_pct":     frame_coverage_pct,
         "line_count":             int(line_count),
         "total_line_length_m":    float(total_line_length_m),
         "average_line_length_m":  float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
@@ -2713,7 +2791,7 @@ def compute_aoi_mission_outputs(
     }
 
 
-def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, swath_m=None):
+def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, speed_ms, enabled_cameras, lead_in_out_m=150.0, turn_time_per_line_min=4.0, search_step_deg=5.0, storage_profile_label="Uncompressed RAW", storage_per_image_mb=130.0, along_track_reach_m=None, swath_m=None, camera_solutions=None):
     if not (np.isfinite(search_step_deg) and float(search_step_deg) > 0):
         search_step_deg = 5.0
     best = None
@@ -2730,6 +2808,9 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
             turn_time_per_line_min=turn_time_per_line_min,
             storage_profile_label=storage_profile_label,
             storage_per_image_mb=storage_per_image_mb,
+            along_track_reach_m=along_track_reach_m,
+            swath_m=swath_m,
+            camera_solutions=None,  # skip frame coverage during search for speed
         )
         if candidate is not None:
             key = (
@@ -2743,7 +2824,25 @@ def optimize_aoi_flight_direction(aoi_payload, line_spacing_m, photo_spacing_m, 
         heading += float(search_step_deg)
     if best is None:
         return None
-    result = dict(best[1])
+    # Re-run the winning heading WITH frame coverage check
+    best_heading = float(best[1].get("flight_azimuth_deg", 0.0))
+    result = compute_aoi_mission_outputs(
+        aoi_payload=aoi_payload,
+        line_spacing_m=line_spacing_m,
+        photo_spacing_m=photo_spacing_m,
+        speed_ms=speed_ms,
+        enabled_cameras=enabled_cameras,
+        flight_azimuth_deg=best_heading,
+        lead_in_out_m=lead_in_out_m,
+        turn_time_per_line_min=turn_time_per_line_min,
+        storage_profile_label=storage_profile_label,
+        storage_per_image_mb=storage_per_image_mb,
+        along_track_reach_m=along_track_reach_m,
+        swath_m=swath_m,
+        camera_solutions=camera_solutions,
+    )
+    if result is None:
+        return None
     result["flight_direction_optimized"] = True
     result["flight_direction_search_step_deg"] = float(search_step_deg)
     return result
@@ -2809,30 +2908,41 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
                 ix, iy = interior.xy
                 ax.plot(_sx(ix), _sx(iy), color="#30363d", lw=1.0, zorder=2)
 
-    _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
-    # Add legend entries for AOI boundaries
-    import matplotlib.patches as _mpatch
-    import matplotlib.lines as _mlines
-    _buf_patch = _mlines.Line2D([], [], color="#ff4444", lw=2.0,
-                                 label="Flight planning boundary (buffered)")
-    _orig_patch = _mlines.Line2D([], [], color="#4488ff", lw=1.5, ls="--",
-                                  label="Original AOI (client boundary)")
+    # Determine whether a buffer was actually applied
+    _buf_m = float(mission_outputs.get("buffered_m", 0.0))
+    _has_buffer = _buf_m > 0 and original_aoi_poly is not None
 
-    # Draw original (unbuffered) AOI as dashed white outline if buffer applied
-    if original_aoi_poly is not None and not getattr(original_aoi_poly, "is_empty", True):
-        try:
-            _orig_geoms = ([original_aoi_poly]
-                           if getattr(original_aoi_poly, "geom_type", "") == "Polygon"
-                           else list(getattr(original_aoi_poly, "geoms", [])))
-            for _og in _orig_geoms:
-                if getattr(_og, "is_empty", True):
-                    continue
-                _ox, _oy = _og.exterior.xy
-                ax.plot(_sx(_ox), _sx(_oy),
-                        color="#4488ff", lw=1.5, ls="--", alpha=0.9, zorder=5,
-                        label="Original AOI (client boundary)")
-        except Exception:
-            pass
+    import matplotlib.lines as _mlines
+    legend_handles = []
+
+    if _has_buffer:
+        # Draw buffered polygon as solid red (flight planning boundary)
+        _plot_poly(polygon, edgecolor="#ff4444", facealpha=0.06, lw=2.0)
+        legend_handles.append(_mlines.Line2D([], [], color="#ff4444", lw=2.0,
+                                              label=f"Flight planning boundary (+{_buf_m:.0f} m)"))
+
+        # Draw original (unbuffered) AOI as dashed blue
+        if not getattr(original_aoi_poly, "is_empty", True):
+            try:
+                _orig_geoms = ([original_aoi_poly]
+                               if getattr(original_aoi_poly, "geom_type", "") == "Polygon"
+                               else list(getattr(original_aoi_poly, "geoms", [])))
+                for _idx_og, _og in enumerate(_orig_geoms):
+                    if getattr(_og, "is_empty", True):
+                        continue
+                    _ox, _oy = _og.exterior.xy
+                    ax.fill(_sx(_ox), _sx(_oy), color="#4488ff", alpha=0.04, zorder=2)
+                    ax.plot(_sx(_ox), _sx(_oy),
+                            color="#4488ff", lw=2.0, ls="--", alpha=0.9, zorder=5)
+            except Exception:
+                pass
+            legend_handles.append(_mlines.Line2D([], [], color="#4488ff", lw=2.0, ls="--",
+                                                  label="Original AOI (client boundary)"))
+    else:
+        # No buffer — draw a single AOI boundary
+        _plot_poly(polygon, edgecolor="#58a6ff", facealpha=0.08, lw=2.0)
+        legend_handles.append(_mlines.Line2D([], [], color="#58a6ff", lw=2.0,
+                                              label="AOI boundary"))
 
     for line in mission_outputs.get("mission_line_geometries", []):
         try:
@@ -2970,6 +3080,16 @@ def make_aoi_mission_figure(mission_outputs, dist_unit="m", show_basemap=True, b
     _aoi_name = mission_outputs.get("name", "AOI")
     ax.set_title(f"{_aoi_name} — flight lines", color="#c9d1d9", fontsize=10, pad=6)
     ax.tick_params(axis="both", colors="#8b949e", labelsize=8, length=3)
+
+    # Add flight lines legend handle
+    if mission_outputs.get("mission_line_geometries"):
+        legend_handles.append(_mlines.Line2D([], [], color="#f0c040", lw=1.0,
+                                              label="Flight lines"))
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=7,
+                  facecolor="#1e2d40", edgecolor="#3d5166", labelcolor="#c9d1d9",
+                  framealpha=0.85)
+
     fig.tight_layout(pad=1.5)
     return fig, _basemap_error
 
@@ -3546,18 +3666,22 @@ else:
 
             # ── Coverage buffer ───────────────────────────────────────────────
             st.markdown("**Coverage buffer**")
-            aoi_buffer_m = st.number_input(
+            _buf_col1, _buf_col2 = st.columns([2, 1])
+            aoi_buffer_m = _buf_col1.number_input(
                 f"Buffer distance ({dist_unit})",
                 min_value=0.0,
                 max_value=m_to_unit(10000.0, dist_unit),
                 value=0.0,
                 step=m_to_unit(100.0, dist_unit),
-                key="aoi_buffer_display",
+                key="aoi_buffer_std",
                 help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage. "
-                     "Standard example defaults to 0 — set a buffer when using a real KML AOI.",
+                     "Set a buffer to verify edge coverage — typically 300–600 m for oblique rigs.",
             )
             aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
             st.session_state["aoi_buffer_m_internal"] = aoi_buffer_m
+            _buf_col2.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
+            if aoi_buffer_m > 0:
+                _buf_col2.caption(f"≈ {aoi_buffer_m:.0f} m buffer")
         else:
             kml_files = list_library_kmls()
             if not kml_files:
@@ -3590,11 +3714,12 @@ else:
                 max_value=m_to_unit(10000.0, dist_unit),
                 value=m_to_unit(500.0, dist_unit),
                 step=m_to_unit(100.0, dist_unit),
-                key="aoi_buffer_display",
+                key="aoi_buffer_kml",
                 help="Flight lines extend this distance beyond the AOI boundary to ensure full coverage of the edge. "
                      "Default 500 m ensures the outermost oblique cameras fully cover the AOI perimeter.",
             )
             aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
+            st.session_state["aoi_buffer_m_internal"] = aoi_buffer_m
             _buf_col2.markdown("<div style='padding-top:28px'></div>", unsafe_allow_html=True)
             if aoi_buffer_m > 0:
                 _buf_col2.caption(f"≈ {aoi_buffer_m:.0f} m buffer")
@@ -3685,6 +3810,7 @@ else:
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
                 swath_m=getattr(mc, "combined_swath_m", None),
+                camera_solutions=solutions,
             )
         else:
             mission_outputs = compute_aoi_mission_outputs(
@@ -3700,6 +3826,7 @@ else:
                 storage_per_image_mb=storage_per_image_mb,
                 along_track_reach_m=_along_reach,
                 swath_m=getattr(mc, "combined_swath_m", None),
+                camera_solutions=solutions,
             )
 
     # Store original unbuffered polygon for map overlay
@@ -3720,15 +3847,33 @@ else:
         m7.metric("Estimated storage", f"{mission_outputs['total_storage_mb'] / 1024.0:.1f} GB")
         m8.metric("Estimated flying time", f"{mission_outputs['flight_time_s'] / 3600.0:.2f} hr")
 
-        # Coverage QA
+        # Coverage QA — strip and frame-level checks
         _cov_pct = mission_outputs.get("coverage_pct")
+        _frame_cov_pct = mission_outputs.get("frame_coverage_pct")
+
         if _cov_pct is not None:
-            _cov_col = "normal" if _cov_pct >= 99.0 else ("off" if _cov_pct >= 95.0 else "inverse")
             _cov_icon = "✅" if _cov_pct >= 99.0 else ("⚠️" if _cov_pct >= 95.0 else "❌")
-            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of AOI area** — "
-                    + ("Full coverage achieved." if _cov_pct >= 99.0
-                       else f"Partial coverage — {100-_cov_pct:.1f}% of AOI may be missed. "
-                            "Try reducing line spacing or adjusting flight azimuth."))
+            st.info(f"{_cov_icon} **Flight strip coverage: {_cov_pct:.1f}% of original AOI** — "
+                    + ("Full strip coverage achieved." if _cov_pct >= 99.0
+                       else f"Partial coverage — {100-_cov_pct:.1f}% of AOI may be missed by strips. "
+                            "Try increasing the buffer, reducing line spacing or adjusting flight azimuth."))
+
+        if _frame_cov_pct is not None:
+            _fc_icon = "✅" if _frame_cov_pct >= 99.0 else ("⚠️" if _frame_cov_pct >= 95.0 else "❌")
+            _fc_msg = (
+                f"{_fc_icon} **Camera frame coverage: {_frame_cov_pct:.1f}% of original AOI** — "
+                + ("Every part of the original AOI is covered by at least one camera frame." if _frame_cov_pct >= 99.0
+                   else f"Frame-level gap detected — {100-_frame_cov_pct:.1f}% of the original AOI is not covered by any camera frame. "
+                        "Increase the coverage buffer to extend flight lines further beyond the AOI boundary.")
+            )
+            if _frame_cov_pct >= 99.0:
+                st.success(_fc_msg)
+            elif _frame_cov_pct >= 95.0:
+                st.warning(_fc_msg)
+            else:
+                st.error(_fc_msg)
+        elif _cov_pct is not None:
+            st.caption("Frame-level coverage check not available (requires camera solutions).")
 
         optimized_note = ""
         if mission_outputs.get("flight_direction_optimized"):
