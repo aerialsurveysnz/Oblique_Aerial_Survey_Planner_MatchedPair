@@ -800,6 +800,16 @@ def make_kml_export(mission_outputs, solutions=None):
     aoi_poly      = (mission_outputs.get("original_aoi_polygon")
                    or mission_outputs.get("aoi_polygon"))  # prefer original unbuffered
 
+    # ── Mercator scale for trigger placement ──────────────────────────────────
+    # mission_lines are in Web Mercator offsets; photo_sp is ground-truth metres.
+    # Scale photo_sp into Mercator units so triggers land at correct ground spacing.
+    _kml_lat0 = mission_outputs.get("lat0")
+    if _kml_lat0 is not None:
+        _kml_merc_scale = 1.0 / max(_m.cos(_m.radians(float(_kml_lat0))), 1e-6)
+    else:
+        _kml_merc_scale = 1.0
+    photo_sp_merc = photo_sp * _kml_merc_scale  # spacing in Mercator coordinate units
+
     # KML colours: AABBGGRR
     _cam_cols = {
         "nadir":   ("ff00ffff", "1800ffff"),
@@ -826,6 +836,9 @@ def make_kml_export(mission_outputs, solutions=None):
                 corners = camera_polygon(_sol)
                 if not corners or not all(_m.isfinite(v) for xy in corners for v in xy):
                     corners = None
+                else:
+                    # Scale footprint corners from ground metres to Mercator units
+                    corners = [(cx * _kml_merc_scale, cy * _kml_merc_scale) for cx, cy in corners]
             except Exception:
                 corners = None
             cam_data.append((lbl, sid, lc, fc, corners))
@@ -870,7 +883,7 @@ def make_kml_export(mission_outputs, solutions=None):
 
     # ── Build trigger positions per line (shared between folders 2 & 3) ───────
     trigger_positions = []  # list of (cx, cy, ux, uy, ax, ay) per trigger
-    if mission_lines and photo_sp > 0:
+    if mission_lines and photo_sp_merc > 0:
         import math as _m2
         for lg in mission_lines:
             try:
@@ -881,9 +894,9 @@ def make_kml_export(mission_outputs, solutions=None):
                 if seg < 1: continue
                 ux,uy = (x1-x0)/seg, (y1-y0)/seg
                 ax,ay = -uy, ux
-                n = max(1, int(_m2.ceil(seg/photo_sp)) + 1)
+                n = max(1, int(_m2.ceil(seg/photo_sp_merc)) + 1)
                 for i in range(n):
-                    t = min(i*photo_sp, seg)
+                    t = min(i*photo_sp_merc, seg)
                     trigger_positions.append((x0+ux*t, y0+uy*t, ux, uy, ax, ay))
             except Exception:
                 continue
@@ -2585,6 +2598,24 @@ def compute_aoi_mission_outputs(
     # Along-track footprint reach — how far fore/aft obliques see beyond nadir
     along_reach = float(along_track_reach_m) if along_track_reach_m else float(photo_spacing_m) * 1.5
 
+    # ── Web Mercator scale correction ─────────────────────────────────────────
+    # When the AOI polygon lives in EPSG:3857 (Web Mercator) coordinates, 1 unit
+    # in Mercator space != 1 metre on the ground.  The ratio is 1/cos(lat) — at
+    # 41°S that's ≈ 1.325, so applying 444 m directly as a Mercator offset would
+    # produce only ~335 m on the ground.  We scale all ground-distance values
+    # (spacings, lead-in, reach) by this factor so they produce the correct
+    # real-world spacing when used as Mercator coordinate offsets.
+    # For standard (non-geographic) AOIs, lat0 is absent and the scale is 1.0.
+    _lat0 = aoi_payload.get("lat0")
+    if _lat0 is not None:
+        _merc_scale = 1.0 / max(math.cos(math.radians(float(_lat0))), 1e-6)
+    else:
+        _merc_scale = 1.0
+    line_spacing_m  *= _merc_scale
+    photo_spacing_m *= _merc_scale
+    lead_in         *= _merc_scale
+    along_reach     *= _merc_scale
+
     # ── Rotate polygon into flight-line frame (lines become vertical) ─────────
     rotated = shapely_rotate(polygon, float(flight_azimuth_deg),
                              origin="centroid", use_radians=False)
@@ -2675,7 +2706,8 @@ def compute_aoi_mission_outputs(
     per_trigger_mb = sum(per_cam_mb)
     storage_per_image_mb = (per_trigger_mb / enabled_cam_count) if enabled_cam_count else float(storage_per_image_mb)
     total_storage_mb = total_exposures * per_trigger_mb
-    airborne_s = total_line_length_m / speed_ms if speed_ms > 0 else float("nan")
+    # total_line_length_m is in Mercator units; convert to ground distance for time
+    airborne_s = (total_line_length_m / _merc_scale) / speed_ms if speed_ms > 0 else float("nan")
     turn_s     = max(line_count - 1, 0) * turn_time_per_line_s
     flight_s   = airborne_s + turn_s if np.isfinite(airborne_s) else float("nan")
 
@@ -2689,7 +2721,9 @@ def compute_aoi_mission_outputs(
     try:
         check_poly = aoi_payload.get("original_polygon") or polygon
         # --- Strip coverage (fast approximation) ---
-        half_w = (float(swath_m) / 2.0) if (swath_m and float(swath_m) > 0) else (line_spacing_m / 2.0)
+        # swath_m is in ground metres; scale to Mercator units for the buffer
+        _swath_merc = (float(swath_m) * _merc_scale) if (swath_m and float(swath_m) > 0) else 0.0
+        half_w = (_swath_merc / 2.0) if _swath_merc > 0 else (line_spacing_m / 2.0)
         strips = [seg.buffer(half_w, cap_style=2) for seg in raw_segments
                   if len(list(seg.coords)) >= 2]
         if strips:
@@ -2709,7 +2743,9 @@ def compute_aoi_mission_outputs(
             for _cam_s, _sol_s, _ in camera_solutions:
                 fp = camera_polygon(_sol_s)
                 if fp and len(fp) >= 3 and all(math.isfinite(v) for xy in fp for v in xy):
-                    cam_footprints.append(fp)
+                    # Scale footprint corners from ground metres to Mercator units
+                    fp_merc = [(fcx * _merc_scale, fcy * _merc_scale) for fcx, fcy in fp]
+                    cam_footprints.append(fp_merc)
 
             if cam_footprints:
                 frame_polys = []
@@ -2782,10 +2818,10 @@ def compute_aoi_mission_outputs(
         "coverage_pct":           coverage_pct,
         "frame_coverage_pct":     frame_coverage_pct,
         "line_count":             int(line_count),
-        "total_line_length_m":    float(total_line_length_m),
-        "average_line_length_m":  float(np.mean(line_lengths_m)) if line_lengths_m else 0.0,
-        "photo_spacing_m":        float(photo_spacing_m),
-        "line_spacing_m":         float(line_spacing_m),
+        "total_line_length_m":    float(total_line_length_m / _merc_scale),
+        "average_line_length_m":  float(np.mean(line_lengths_m) / _merc_scale) if line_lengths_m else 0.0,
+        "photo_spacing_m":        float(photo_spacing_m / _merc_scale),
+        "line_spacing_m":         float(line_spacing_m / _merc_scale),
         "trigger_events":         int(total_exposures),
         "frames_per_camera":      int(total_exposures),
         "total_images":           int(total_exposures * enabled_cam_count),
