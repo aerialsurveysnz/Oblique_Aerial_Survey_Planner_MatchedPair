@@ -2473,14 +2473,37 @@ def build_buffered_aoi(aoi_payload, buffer_m):
     try:
         buffered = poly.buffer(float(buffer_m), join_style=2)  # mitre join for sharp corners
         if buffered.is_empty or not buffered.is_valid:
+            st.warning(f"⚠️ Buffer operation produced an invalid polygon — using original AOI.")
             return aoi_payload
         result = dict(aoi_payload)
         result["original_polygon"] = poly          # preserve original BEFORE overwriting
         result["polygon"]  = buffered
         result["area_m2"]  = float(buffered.area)
         result["buffered_m"] = float(buffer_m)
+
+        # ── Update geographic bounds to reflect the larger buffered polygon ───
+        # mx0, my0, lon0, lat0 stay the same (projection origin doesn't move),
+        # but lon/lat bounds must expand so basemap tiles cover the buffered area.
+        mx0 = aoi_payload.get("mx0")
+        my0 = aoi_payload.get("my0")
+        if mx0 is not None and my0 is not None:
+            bminx, bminy, bmaxx, bmaxy = buffered.bounds
+            import math as _bm
+            _R = 6378137.0
+            result["lon_min"] = _bm.degrees((mx0 + bminx) / _R)
+            result["lon_max"] = _bm.degrees((mx0 + bmaxx) / _R)
+            result["lat_min"] = _bm.degrees(2 * _bm.atan(_bm.exp((my0 + bminy) / _R)) - _bm.pi / 2)
+            result["lat_max"] = _bm.degrees(2 * _bm.atan(_bm.exp((my0 + bmaxy) / _R)) - _bm.pi / 2)
+
+        # Diagnostic: confirm buffer actually enlarged the polygon
+        _orig_area = poly.area
+        _buff_area = buffered.area
+        if _buff_area <= _orig_area:
+            st.warning(f"⚠️ Buffer did not enlarge polygon: original={_orig_area:.0f} m², buffered={_buff_area:.0f} m²")
+
         return result
-    except Exception:
+    except Exception as exc:
+        st.warning(f"⚠️ Buffer failed ({exc}) — using original AOI.")
         return aoi_payload
 
 
@@ -3671,11 +3694,11 @@ else:
                 f"Buffer distance ({dist_unit})",
                 min_value=0.0,
                 max_value=m_to_unit(10000.0, dist_unit),
-                value=0.0,
+                value=m_to_unit(500.0, dist_unit),
                 step=m_to_unit(100.0, dist_unit),
                 key="aoi_buffer_std",
                 help="Flight lines extend this distance beyond the AOI boundary to ensure full edge coverage. "
-                     "Set a buffer to verify edge coverage — typically 300–600 m for oblique rigs.",
+                     "Default 500 m ensures the outermost oblique cameras fully cover the AOI perimeter.",
             )
             aoi_buffer_m = unit_to_m(aoi_buffer_m, dist_unit)
             st.session_state["aoi_buffer_m_internal"] = aoi_buffer_m
@@ -3782,6 +3805,22 @@ else:
         # Apply coverage buffer — expand AOI before flight line generation
         _aoi_buffer_m = float(st.session_state.get("aoi_buffer_m_internal", 500.0))
         _aoi_for_planning = build_buffered_aoi(aoi_payload, _aoi_buffer_m)
+
+        # ── Diagnostic: confirm buffer is propagated correctly ────────────────
+        if _aoi_buffer_m > 0:
+            _orig_poly = _aoi_for_planning.get("original_polygon")
+            _plan_poly = _aoi_for_planning.get("polygon")
+            if _orig_poly is not None and _plan_poly is not None:
+                _orig_a = _orig_poly.area
+                _plan_a = _plan_poly.area
+                _ratio = _plan_a / _orig_a if _orig_a > 0 else 0
+                st.caption(
+                    f"🔍 Buffer diagnostic: original AOI = {_orig_a/1e6:.3f} km², "
+                    f"buffered planning AOI = {_plan_a/1e6:.3f} km² "
+                    f"({_ratio:.3f}× area, +{_aoi_buffer_m:.0f} m buffer)"
+                )
+            else:
+                st.caption(f"🔍 Buffer diagnostic: buffer={_aoi_buffer_m:.0f} m but no original_polygon stored — buffer may not have been applied.")
 
         # Compute actual along-track footprint reach from camera solutions
         _along_reach = 0.0
