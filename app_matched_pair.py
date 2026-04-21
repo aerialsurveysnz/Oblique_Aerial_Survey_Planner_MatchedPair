@@ -882,9 +882,18 @@ def make_kml_export(mission_outputs, solutions=None):
         out.append('''  </Folder>''')
 
     # ── Build trigger positions per line (shared between folders 2 & 3) ───────
+    # Use pre-computed positions from compute_aoi_mission_outputs (single source
+    # of truth) so the KML trigger count exactly matches the report.
+    # For frame coverage we also need direction vectors per trigger — compute
+    # those from the mission line each trigger belongs to.
     trigger_positions = []  # list of (cx, cy, ux, uy, ax, ay) per trigger
-    if mission_lines and photo_sp_merc > 0:
+    _precomputed = mission_outputs.get("mission_trigger_positions")
+    if _precomputed and mission_lines:
         import math as _m2
+        # Build a lookup: for each trigger (cx, cy), find its nearest line's direction
+        # Since triggers are built line-by-line in order, we can assign them by
+        # walking through the lines and assigning the correct count per line.
+        _line_dirs = []
         for lg in mission_lines:
             try:
                 lc2 = list(lg.coords)
@@ -894,12 +903,33 @@ def make_kml_export(mission_outputs, solutions=None):
                 if seg < 1: continue
                 ux,uy = (x1-x0)/seg, (y1-y0)/seg
                 ax,ay = -uy, ux
-                n = max(1, int(_m2.ceil(seg/photo_sp_merc)) + 1)
-                for i in range(n):
-                    t = min(i*photo_sp_merc, seg)
-                    trigger_positions.append((x0+ux*t, y0+uy*t, ux, uy, ax, ay))
+                _line_dirs.append((ux, uy, ax, ay))
             except Exception:
-                continue
+                _line_dirs.append((0, 1, -1, 0))
+
+        # Assign direction to each trigger by nearest-line (simple distance check)
+        for cx, cy in _precomputed:
+            best_dist = float("inf")
+            best_dir = (0, 1, -1, 0)
+            for idx_l, lg in enumerate(mission_lines):
+                try:
+                    lc2 = list(lg.coords)
+                    if len(lc2) < 2: continue
+                    # Distance from point to line segment
+                    x0,y0 = lc2[0]; x1,y1 = lc2[-1]
+                    dx, dy = x1-x0, y1-y0
+                    seg2 = dx*dx + dy*dy
+                    if seg2 < 1: continue
+                    t = max(0, min(1, ((cx-x0)*dx + (cy-y0)*dy) / seg2))
+                    px, py = x0 + t*dx, y0 + t*dy
+                    d = _m2.hypot(cx-px, cy-py)
+                    if d < best_dist:
+                        best_dist = d
+                        if idx_l < len(_line_dirs):
+                            best_dir = _line_dirs[idx_l]
+                except Exception:
+                    continue
+            trigger_positions.append((cx, cy, best_dir[0], best_dir[1], best_dir[2], best_dir[3]))
 
     # ── 2. TRIGGER POINTS ─────────────────────────────────────────────────────
     if trigger_positions:
@@ -2642,7 +2672,6 @@ def compute_aoi_mission_outputs(
     raw_segments = []
     line_count = 0
     total_line_length_m = 0.0
-    total_exposures = 0
     line_lengths_m = []
 
     for x in offsets:
@@ -2683,7 +2712,6 @@ def compute_aoi_mission_outputs(
             line_count += 1
             total_line_length_m += seg_len
             line_lengths_m.append(seg_len)
-            total_exposures += max(1, int(math.ceil(seg_len / photo_spacing_m)) + 1)
 
     # ── Rotate segments back to geographic orientation ────────────────────────
     mission_line_geometries = []
@@ -2696,6 +2724,43 @@ def compute_aoi_mission_outputs(
         except Exception:
             continue
 
+    # ── Build trigger positions (rotated frame → geographic) ─────────────────
+    # Single source of truth — KML and reports both read from this list.
+    # Strategy: evenly spaced triggers from the start of each line, plus a final
+    # endpoint trigger when the remaining gap exceeds 10% of photo spacing (so
+    # the line end is always covered).  Near-duplicate endpoints are suppressed.
+    _centroid = polygon.centroid
+    _cx0, _cy0 = _centroid.x, _centroid.y
+    _az_rad = math.radians(-float(flight_azimuth_deg))
+    _cos_az, _sin_az = math.cos(_az_rad), math.sin(_az_rad)
+    _min_endpoint_gap = photo_spacing_m * 0.1  # suppress endpoint if closer than 10% spacing
+    mission_trigger_positions = []  # list of (x, y) in geographic/Mercator frame
+    for seg in raw_segments:
+        coords = list(seg.coords)
+        if len(coords) < 2:
+            continue
+        x0, y0 = coords[0]
+        x1, y1 = coords[-1]
+        seg_len = math.hypot(x1 - x0, y1 - y0)
+        if seg_len < 1:
+            continue
+        ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
+        n_inner = max(1, int(math.floor(seg_len / photo_spacing_m)) + 1)
+        # Build t-offsets: evenly spaced + conditional endpoint
+        t_offsets = [i * photo_spacing_m for i in range(n_inner)]
+        remainder = seg_len - t_offsets[-1]
+        if remainder > _min_endpoint_gap:
+            t_offsets.append(seg_len)
+        for t in t_offsets:
+            # Trigger position in rotated frame
+            rx = x0 + ux * t
+            ry = y0 + uy * t
+            # Rotate back to geographic frame (same transform as mission_line_geometries)
+            dx, dy = rx - _cx0, ry - _cy0
+            gx = _cx0 + dx * _cos_az - dy * _sin_az
+            gy = _cy0 + dx * _sin_az + dy * _cos_az
+            mission_trigger_positions.append((gx, gy))
+
     # ── Storage and time estimates ────────────────────────────────────────────
     enabled_cam_count = max(1, len(enabled_cameras))
     per_cam_mb = [
@@ -2705,7 +2770,6 @@ def compute_aoi_mission_outputs(
     ]
     per_trigger_mb = sum(per_cam_mb)
     storage_per_image_mb = (per_trigger_mb / enabled_cam_count) if enabled_cam_count else float(storage_per_image_mb)
-    total_storage_mb = total_exposures * per_trigger_mb
     # total_line_length_m is in Mercator units; convert to ground distance for time
     airborne_s = (total_line_length_m / _merc_scale) / speed_ms if speed_ms > 0 else float("nan")
     turn_s     = max(line_count - 1, 0) * turn_time_per_line_s
@@ -2763,9 +2827,12 @@ def compute_aoi_mission_outputs(
                     ux, uy = (x1 - x0) / seg_len, (y1 - y0) / seg_len
                     # Across direction (perpendicular)
                     ax_d, ay_d = -uy, ux
-                    n_triggers = max(1, int(math.ceil(seg_len / photo_spacing_m)) + 1)
-                    for i in range(n_triggers):
-                        t = min(i * photo_spacing_m, seg_len)
+                    n_inner_fc = max(1, int(math.floor(seg_len / photo_spacing_m)) + 1)
+                    t_offsets_fc = [i * photo_spacing_m for i in range(n_inner_fc)]
+                    _remainder_fc = seg_len - t_offsets_fc[-1]
+                    if _remainder_fc > _min_endpoint_gap:
+                        t_offsets_fc.append(seg_len)
+                    for t in t_offsets_fc:
                         cx = x0 + ux * t
                         cy = y0 + uy * t
                         # Place each camera footprint at this trigger position
@@ -2822,13 +2889,13 @@ def compute_aoi_mission_outputs(
         "average_line_length_m":  float(np.mean(line_lengths_m) / _merc_scale) if line_lengths_m else 0.0,
         "photo_spacing_m":        float(photo_spacing_m / _merc_scale),
         "line_spacing_m":         float(line_spacing_m / _merc_scale),
-        "trigger_events":         int(total_exposures),
-        "frames_per_camera":      int(total_exposures),
-        "total_images":           int(total_exposures * enabled_cam_count),
+        "trigger_events":         len(mission_trigger_positions),
+        "frames_per_camera":      len(mission_trigger_positions),
+        "total_images":           int(len(mission_trigger_positions) * enabled_cam_count),
         "storage_profile_label":  storage_profile_label,
         "storage_per_image_mb":   float(storage_per_image_mb),
         "per_trigger_storage_mb": float(per_trigger_mb),
-        "total_storage_mb":       float(total_storage_mb),
+        "total_storage_mb":       float(len(mission_trigger_positions) * per_trigger_mb),
         "airborne_time_s":        float(airborne_s),
         "turn_time_per_line_s":   float(turn_time_per_line_s),
         "total_turn_time_s":      float(turn_s),
@@ -2836,6 +2903,8 @@ def compute_aoi_mission_outputs(
         "flight_azimuth_deg":     float(flight_azimuth_deg),
         "lead_in_out_m":          float(lead_in_out_m),
         "mission_line_geometries": mission_line_geometries,
+        "mission_trigger_positions": mission_trigger_positions,
+        "merc_scale":             float(_merc_scale),
         "aoi_polygon":            polygon,
         "original_aoi_polygon":   (aoi_payload.get("original_polygon") or polygon),
         "lon0":    aoi_payload.get("lon0"),
